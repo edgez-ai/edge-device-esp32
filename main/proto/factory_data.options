@@ -1,0 +1,8 @@
+edge.device.factory.FactoryData.serial_number type:FT_STATIC max_length:64
+edge.device.factory.FactoryData.device_public_key type:FT_STATIC max_size:32
+edge.device.factory.FactoryData.device_private_key type:FT_STATIC max_size:32
+edge.device.factory.FactoryData.credential_signature type:FT_STATIC max_size:64
+edge.device.factory.FactoryData.signer_public_key type:FT_STATIC max_size:32
+edge.device.factory.FactoryData.ssid type:FT_STATIC max_length:32
+edge.device.factory.FactoryData.passphrase type:FT_STATIC max_length:64
+edge.device.factory.FactoryData.ble_pin_code type:FT_STATIC max_length:6

@@ -1,0 +1,43 @@
+menu "Packaged Morse Micro HaLow Driver"
+
+    config MM_RESET_N
+        int "Morse Micro reset pin"
+        range 0 48
+        default 8
+
+    config MM_WAKE
+        int "Morse Micro wake pin"
+        range 0 48
+        default 9
+
+    config MM_BUSY
+        int "Morse Micro busy pin"
+        range 0 48
+        default 7
+
+    config MM_SPI_SCK
+        int "Morse Micro SPI clock pin"
+        range 0 48
+        default 4
+
+    config MM_SPI_MOSI
+        int "Morse Micro SPI MOSI pin"
+        range 0 48
+        default 3
+
+    config MM_SPI_MISO
+        int "Morse Micro SPI MISO pin"
+        range 0 48
+        default 5
+
+    config MM_SPI_CS
+        int "Morse Micro SPI chip-select pin"
+        range 0 48
+        default 2
+
+    config MM_SPI_IRQ
+        int "Morse Micro SPI interrupt pin"
+        range 0 48
+        default 6
+
+endmenu

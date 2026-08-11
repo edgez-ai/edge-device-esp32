@@ -1,0 +1,274 @@
+syntax = "proto3";
+
+package ai.edgez.halow;
+
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  REQUEST = 1;
+  RESPONSE = 2;
+  ACKNOWLEDGE = 3;
+  STREAMING = 4;
+  BROADCAST = 9;
+}
+
+enum Interface {
+  INTERFACE_UNSPECIFIED = 0;
+  USB = 1;
+  BLE = 2;
+  WIFI = 3;
+  ETHERNET = 4;
+  HALOW = 5;
+  LORA = 6;
+  LIBP2P = 7;
+}
+
+enum Mime {
+  MIME_UNSPECIFIED = 0;
+  MIME_TEXT = 1;
+  MIME_VOICE = 2;
+  MIME_IMAGE = 3;
+  MIME_VIDEO = 4;
+  MIME_BINARY = 5;
+  MIME_VOICE_CALL = 6; // realtime EVC2 binary call frame; best effort, not persisted
+}
+
+enum MarkerColor {
+  MARKER_DEFAULT = 0;
+  MARKER_RED = 1;
+  MARKER_BLUE = 2;
+  MARKER_PURPLE = 3;
+  MARKER_YELLOW = 4;
+  MARKER_PINK = 5;
+  MARKER_BROWN = 6;
+  MARKER_GREEN = 7;
+  MARKER_ORANGE = 8;
+  MARKER_DEEP_PURPLE = 9;
+  MARKER_LIGHT_BLUE = 10;
+  MARKER_CYAN = 11;
+  MARKER_TEAL = 12;
+  MARKER_LIME = 13;
+  MARKER_DEEP_ORANGE = 14;
+  MARKER_GRAY = 15;
+  MARKER_BLUE_GRAY = 16;
+}
+
+enum DeviceSettingsAction {
+  DEVICE_SETTINGS_ACTION_UNSPECIFIED = 0;
+  DEVICE_SETTINGS_GET = 1;
+  DEVICE_SETTINGS_SET = 2;
+  DEVICE_SETTINGS_REPORT = 3;
+}
+
+enum ScriptConfigAction {
+  SCRIPT_CONFIG_ACTION_UNSPECIFIED = 0;
+  SCRIPT_CONFIG_BEGIN = 1;
+  SCRIPT_CONFIG_CHUNK = 2;
+  SCRIPT_CONFIG_COMMIT = 3;
+  SCRIPT_CONFIG_DELETE = 4;
+  SCRIPT_CONFIG_REPORT = 5;
+}
+
+enum LicenseStatus {
+  LICENSE_STATUS_UNSPECIFIED = 0;
+  LICENSE_STATUS_AUTHORIZED = 1;
+  LICENSE_STATUS_DEVICE_NOT_LICENSED = 2;
+  LICENSE_STATUS_SDK_RELEASE_REQUIRED = 3;
+  LICENSE_STATUS_SDK_VERSION_INCOMPATIBLE = 4;
+  LICENSE_STATUS_SDK_RELEASE_INVALID = 5;
+}
+
+message MessageBody {
+  uint64 message_id_high = 1; // high 64 bits of message UUID
+  uint64 message_id_low = 2;  // low 64 bits of message UUID
+  sint32 sequence = 3; // when a message need to split into chunks, use sequence to control it
+  Mime mime = 4;         // encrypted payload media type
+  bytes payload = 5;
+  uint64 group_id_high = 6; // omitted for direct messages
+  uint64 group_id_low = 7;  // omitted for direct messages
+}
+
+message Report {
+  repeated Peer peers = 1;
+}
+
+message NetworkPacket {
+  uint64 from = 1;
+  uint64 to = 2;
+  Operation operation = 3;
+  Interface interface = 4;  // self interface when option is request,broadcast, target interface for response.
+  oneof body {
+    bytes payload = 100;
+    MessageBody msg = 101;
+    HaLowInterfaceStatus status = 102;
+    HaLowInitConfig init = 103;
+    DeviceSettings device_settings = 104;
+    ScriptConfig script_config = 105;
+    Beacon beacon = 106; // beacon heard from the management Vendor IE
+    Report report = 107;
+    LocationUpdate location_update = 108;
+  }
+}
+
+// Transient mobile GPS update. The device keeps it in RAM so periodic
+// tracking does not cause repeated NVS writes.
+message LocationUpdate {
+  float latitude = 1;
+  float longitude = 2;
+  uint64 timestamp_ms = 3;
+}
+
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  DEVICE_TYPE_UNKNOWN = 1;
+  DEVICE_TYPE_USER = 2;
+  DEVICE_TYPE_GATEWAY = 3;
+  DEVICE_TYPE_BEACON = 4;
+  DEVICE_TYPE_SENSOR = 5;
+  DEVICE_TYPE_RELAY = 6;
+}
+
+enum AlertCondition {
+  ALERT_CONDITION_UNSPECIFIED = 0;
+  ALERT_CONDITION_ENTER = 1;
+  ALERT_CONDITION_EXIT = 2;
+  ALERT_CONDITION_NEAR = 3;
+  ALERT_CONDITION_FAR = 4;
+  ALERT_CONDITION_LOW_BATTERY = 5;
+}
+
+message GeoFence {
+  uint64 id_high = 1;
+  uint64 id_low = 2;
+  string name = 3;
+  MarkerColor marker = 4;
+  AlertCondition alert_condition = 5;
+  uint32 geo_index = 6;
+}
+
+enum SensorType {
+  SENSOR_UNKNOWN = 0;
+  SENSOR_TEMPERATURE = 1;
+  SENSOR_HUMIDITY = 2;
+  SENSOR_LATITUDE = 3;
+  SENSOR_LONGITUDE = 4;
+  SENSOR_LENGTH = 5;
+  SENSOR_ACCEL_X = 6;  // acceleration in m/s^2
+  SENSOR_ACCEL_Y = 7;  // acceleration in m/s^2
+  SENSOR_ACCEL_Z = 8;  // acceleration in m/s^2
+  SENSOR_GYRO_X = 9;   // angular velocity in rad/s
+  SENSOR_GYRO_Y = 10;  // angular velocity in rad/s
+  SENSOR_GYRO_Z = 11;  // angular velocity in rad/s
+}
+
+message SensorData {
+  SensorType type  = 1;
+  oneof value {
+    bool bool_value = 2;
+    sint32 int_value = 3;
+    float float_value = 4;
+  }
+}
+
+message Peer {
+  uint64 id = 1;
+  sint32 rssi = 2;
+  repeated SensorData sensor_data = 3;
+}
+
+message Beacon {
+  uint64 user_id_high = 1;
+  uint64 user_id_low = 2;
+  string user_name = 3;
+  bytes user_public_key = 4;
+  float latitude = 5;
+  float longitude = 6;
+  MarkerColor marker = 7;
+  DeviceType device_type = 8;
+  bool sleeping = 10;
+  GeoFence geo_fence = 100;
+  repeated SensorData sensor_data = 101;  // only for beacon and sensor type
+}
+
+
+message HaLowInterfaceStatus {
+  bool supported = 1;
+  bool stack_initialized = 2;
+  bool mesh_mode = 3;
+  bool link_up = 4;
+  bool route_ready = 5;
+  bool ready_for_report = 6;
+  uint32 ethertype = 7;
+  string mesh_id = 8;
+  string ip_addr = 9;
+  string gateway = 10;
+  uint64 mac_address = 11;
+  LicenseStatus license_status = 12;
+  string firmware_version = 13;
+}
+
+
+
+message HaLowInitConfig {
+  string country_code = 1;
+  string mesh_id = 2;
+  string passphrase = 3;
+  uint32 max_hop = 4;
+  uint64 user_id_high = 5;
+  uint64 user_id_low = 6;
+  string user_name = 7;
+  bytes user_public_key = 8;
+  string marker = 9;
+  bool has_location = 10;
+  float latitude = 11;
+  float longitude = 12;
+  uint32 mesh_bandwidth_mhz = 13;
+  uint32 mesh_frequency_khz = 14;
+  string sdk_compatibility = 15;
+  string sdk_release_id = 16;
+  bytes sdk_release_signature = 17;
+}
+
+message DeviceSettings {
+  DeviceSettingsAction action = 1;
+  // Legacy device/relay flag. New clients use device_type instead.
+  bool device_mode_enabled = 2;
+  string mesh_id = 3;
+  bool share_location = 4;
+  string user_name = 5;
+  MarkerColor marker = 6;
+  uint32 beacon_interval_seconds = 7;
+  uint64 user_id_high = 8;
+  uint64 user_id_low = 9;
+  bytes user_public_key = 10;
+  bytes user_private_key = 11;
+  float latitude = 12;
+  float longitude = 13;
+  uint32 max_hop = 14;
+  GeoFence geo_fence = 15;
+  string uart_i2c_sensor_type = 16;
+  string rs485_sensor_type = 17;
+  uint32 geo_index = 18;
+  string passphrase = 19;
+  string upstream_wifi_ssid = 20;
+  string upstream_wifi_passphrase = 21;
+  uint64 beacon_unicast = 22;
+  DeviceType device_type = 24;
+  bool sleep_mode_enabled = 25;
+  bool device_gps_enabled = 28;
+}
+
+message ScriptConfig {
+  ScriptConfigAction action = 1;
+  uint32 script_id = 2;
+  string name = 3;
+  uint32 version = 4;
+  uint32 total_size = 5;
+  uint32 offset = 6;
+  bytes chunk = 7;
+  string sensor_type = 8;
+  bool select_uart_i2c = 9;
+  bool select_rs485 = 10;
+  uint32 global_buffer_size = 11;
+  string mime_type = 12;
+}

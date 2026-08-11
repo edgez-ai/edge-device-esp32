@@ -1,0 +1,32 @@
+dependencies:
+  georgik/lua:
+    component_hash: 10698fd2d729b63cca8b882e219c3fa3bd8a9adea26f814f2febb624d0385c23
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 5.5.0~7
+  idf:
+    source:
+      type: idf
+    version: 5.5.4
+  nikas-belogolov/nanopb:
+    component_hash: f87bec16ffb47d5ceb557b7f13acb83cad95046ab155d1af33e488d1b048fddc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.0
+direct_dependencies:
+- georgik/lua
+- idf
+- nikas-belogolov/nanopb
+manifest_hash: 6f5fd8aa8b190dad0d658f39c8b65f74a24ec20be1b482d2453eefdc360145ba
+target: esp32s3
+version: 2.0.0
