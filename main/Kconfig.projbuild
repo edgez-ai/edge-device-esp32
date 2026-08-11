@@ -1,0 +1,382 @@
+menu "RS485 Interface Configuration"
+
+    config RS485_UART_PORT_NUM
+        int "RS485 UART port number"
+        range 0 2 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        default 2 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        range 0 1
+        default 1
+        help
+            UART port number for RS485 communication.
+            Use UART2 on ESP32/ESP32-S3 to avoid conflict with console (UART0) and regular UART (UART1).
+
+    config RS485_UART_TXD
+        int "RS485 UART TXD pin number"
+        range 0 48
+        default 17
+        help
+            GPIO number for RS485 UART TX pin.
+            See UART documentation for available pin numbers.
+
+    config RS485_UART_RXD
+        int "RS485 UART RXD pin number"
+        range 0 48
+        default 18
+        help
+            GPIO number for RS485 UART RX pin.
+            See UART documentation for available pin numbers.
+
+    config RS485_UART_RTS
+        int "RS485 UART RTS pin number (DE/~RE control)"
+        range -1 48
+        default 10
+        help
+            GPIO number for UART RTS pin. This pin is connected to
+            ~RE/DE pin of RS485 transceiver to switch direction.
+            Set to -1 if your transceiver has auto-direction control.
+
+    config RS485_READ_TIMEOUT
+        int "RS485 read timeout (TOUT threshold)"
+        range 1 127
+        default 3
+        help
+            Timeout threshold for UART TOUT feature.
+            Number of symbols (~10 ticks each) with unchanged state on receive pin.
+            TOUT=3 corresponds to approximately 24-33 ticks (about 3.5 character times).
+            This is important for proper Modbus packet detection.
+
+    config RS485_RX_INVERT
+        bool "Invert RS485 RX signal"
+        default y
+        help
+            Enable RX signal inversion. This is commonly required with many RS485 transceivers.
+            If you receive garbled data, try toggling this option.
+
+    config RS485_DEFAULT_BAUD_RATE
+        int "RS485 default baud rate"
+        range 1200 921600
+        default 9600
+        help
+            Default baud rate for RS485 communication if not specified by the local runtime.
+
+    config RS485_RX_BUFFER_SIZE
+        int "RS485 RX buffer size"
+        range 127 4096
+        default 256
+        help
+            Size of the UART RX buffer for RS485 communication.
+
+endmenu
+
+menu "Interface Bridge Configuration"
+
+    config IFACE_BRIDGE_HEX_DUMP_LOG
+        bool "Enable interface bridge TX/RX debug logs"
+        default n
+        help
+            Enable verbose TX/RX metadata and hex dump logs in interface bridge
+            drivers (I2C/UART/RS485). Keep disabled in production to reduce log
+            volume and avoid leaking payload data over logs.
+
+    config IFACE_OPEN_DELAY_WHEN_DISABLED_MS
+        int "Interface open delay when disabled (ms)"
+        range 0 5000
+        default 1000
+        help
+            Delay added after interface open succeeds while the interface
+            enabled flag is false. Set to 0 to disable this delay.
+
+endmenu
+
+menu "HT-HC33 Status LED Configuration"
+
+    config HT_HC33_STATUS_LED
+        bool "Enable HT-HC33 beacon status LED"
+        default y
+        help
+            Drive the HT-HC33 onboard SK6812 RGB status LED for BLE, beacon,
+            and error indications.
+
+    config HT_HC33_STATUS_LED_GPIO
+        int "HT-HC33 status LED GPIO"
+        depends on HT_HC33_STATUS_LED
+        range 0 48
+        default 19
+        help
+            GPIO for the onboard SK6812 RGB LED data input. HT-HC33 uses
+            GPIO19.
+
+    config HT_HC33_BEACON_FLASH_MS
+        int "Beacon LED flash duration (ms)"
+        depends on HT_HC33_STATUS_LED
+        range 10 2000
+        default 100
+        help
+            Length of the non-blocking LED pulse after a successful periodic
+            management beacon refresh.
+
+    config HT_HC33_LED_STEP_MS
+        int "Status LED animation step (ms)"
+        depends on HT_HC33_STATUS_LED
+        range 100 2000
+        default 500
+        help
+            Interval for alternating and flashing BLE status patterns.
+
+    config HT_HC33_LED_BRIGHTNESS
+        int "Status LED brightness"
+        depends on HT_HC33_STATUS_LED
+        range 1 255
+        default 24
+        help
+            Per-channel brightness used for red, green, and blue status colors.
+
+endmenu
+
+menu "L76K Device GPS Configuration"
+
+    config EDGEZ_L76K_GPS
+        bool "Enable optional L76K device GPS support"
+        default y
+        help
+            Build the low-duty-cycle L76K UART driver. No UART, GPIO, task, or
+            receiver initialization occurs until device_gps_enabled is set.
+
+    config EDGEZ_L76K_UART_PORT
+        int "L76K UART port"
+        depends on EDGEZ_L76K_GPS
+        range 0 2
+        default 1
+
+    config EDGEZ_L76K_UART_TX_PIN
+        int "L76K UART TX pin (-1 for receive-only)"
+        depends on EDGEZ_L76K_GPS
+        range -1 48
+        default 38
+
+    config EDGEZ_L76K_UART_RX_PIN
+        int "L76K UART RX pin"
+        depends on EDGEZ_L76K_GPS
+        range 0 48
+        default 39
+
+    config EDGEZ_L76K_RESET_GPIO
+        int "L76K RESET_N GPIO (-1 if not connected)"
+        depends on EDGEZ_L76K_GPS
+        range -1 48
+        default 48
+        help
+            Active-low reset. The driver pulls it low, then releases it to
+            high impedance so the L76K internal pull-up controls the level.
+
+    config EDGEZ_L76K_WAKE_GPIO
+        int "L76K WAKE_UP GPIO (-1 if not connected)"
+        depends on EDGEZ_L76K_GPS
+        range -1 48
+        default 47
+        help
+            Active-low standby control. The driver releases this pin while
+            acquiring and pulls it low while the receiver should sleep.
+
+    config EDGEZ_L76K_POWER_GPIO
+        int "L76K switched-power GPIO (-1 if always powered)"
+        depends on EDGEZ_L76K_GPS
+        range -1 48
+        default -1
+        help
+            HC33 GPS wiring powers VDD_3V3 and VE_3V3 directly, so the default
+            is no switched-power GPIO. WAKE_UP is used for low-power standby.
+
+    config EDGEZ_L76K_POWER_ACTIVE_HIGH
+        bool "L76K power switch is active high"
+        depends on EDGEZ_L76K_GPS
+        default y
+
+    config EDGEZ_L76K_BAUD_RATE
+        int "L76K UART baud rate"
+        depends on EDGEZ_L76K_GPS
+        range 1200 115200
+        default 9600
+
+    config EDGEZ_L76K_FIX_TIMEOUT_SECONDS
+        int "Maximum awake time while acquiring a fix"
+        depends on EDGEZ_L76K_GPS
+        range 5 300
+        default 60
+
+    config EDGEZ_L76K_MIN_UPDATE_SECONDS
+        int "Minimum interval between GPS wakeups"
+        depends on EDGEZ_L76K_GPS
+        range 30 3600
+        default 60
+
+endmenu
+
+menu "Sampling Configuration"
+
+    config EDGEZ_SENSOR_SCRIPTING
+        bool "Enable local sensor sampling and Lua scripts"
+        default y
+        help
+            Builds the local sampling engine, Lua runtime, persistent script
+            store, and UART/I2C/RS485 bridges. Sampling remains local and does
+            not enable cloud registration or cloud sample reporting.
+
+    config SAMPLE_ENABLE_LUA_SCRIPT_DUMP
+        bool "Enable Lua script dump logs"
+        default n
+        help
+            Enable verbose Lua script content dump logs used for debugging
+            script load/execute issues. Keep disabled in production to avoid
+            exposing script content in logs.
+
+endmenu
+
+menu "HaLow Build Configuration"
+
+    config ENABLE_MM_HALOW
+        bool "Enable MM HaLow support"
+        default y
+        help
+            Enable HaLow-related code paths and integration points.
+
+    config MM_HALOW_COUNTRY_CODE
+        string "HaLow country code"
+        default "US"
+        depends on ENABLE_MM_HALOW
+        help
+            Two-letter regulatory country code used for HaLow operation.
+
+    config EDGEZ_HALOW_DISCOVERY_NAME
+        string "EdgeZ HaLow discovery name"
+        default "EdgeZ HaLow"
+        depends on ENABLE_MM_HALOW
+        help
+            Device name advertised in EdgeZ HaLow discovery vendor IEs.
+
+    config MM_MOBILE_DISCOVERY_ONLY
+        bool "Enable mobile raw-bearer discovery mode"
+        default n
+        depends on ENABLE_MM_HALOW
+        help
+            Keep HaLow mesh beacon/probe discovery available while bypassing
+            peer association paths for the mobile raw-radio-buffer bridge.
+
+    config MM_HALOW_STATUS_REPORT_INTERVAL_MS
+        int "Mobile HaLow status report interval (ms)"
+        range 1000 600000
+        default 5000
+        depends on ENABLE_MM_HALOW
+        help
+            Periodic interval for publishing the latest HaLow interface status
+            to the USB vendor transport and BLE notify characteristic.
+
+endmenu
+
+menu "HaLow Mesh Experimental Configuration"
+
+    config MM_EXPERIMENTAL_MESH
+        bool "Enable experimental 802.11s mesh mode"
+        default n
+        depends on ENABLE_MM_HALOW
+        help
+            Enable experimental mesh mode parameters for HaLow connect flow.
+
+if MM_EXPERIMENTAL_MESH
+
+    config MM_EXPERIMENTAL_MESH_OP_CLASS
+        int "Experimental mesh S1G operating class"
+        range 1 255
+        default 1
+
+    config MM_EXPERIMENTAL_MESH_CHAN
+        int "Experimental mesh S1G primary channel number"
+        range 1 255
+        default 27
+
+    config MM_EXPERIMENTAL_MESH_PRI_1MHZ_LOC
+        int "Experimental mesh primary 1 MHz channel location"
+        range 0 1
+        default 0
+
+    config MM_EXPERIMENTAL_MESH_ID
+        string "Experimental mesh ID (OpenWrt mesh_id)"
+        default ""
+
+    config MM_EXPERIMENTAL_MESH_KEY
+        string "Experimental mesh SAE key (OpenWrt option key)"
+        default ""
+
+    config MM_EXPERIMENTAL_MESH_BSSID
+        string "Experimental mesh target BSSID (optional, xx:xx:xx:xx:xx:xx)"
+        default ""
+
+    config MM_EXPERIMENTAL_MESH_SCAN_DWELL_MS
+        int "Experimental mesh internal scan dwell time (ms)"
+        range 15 1000
+        default 120
+
+    config MM_EXPERIMENTAL_MESH_SCAN_HOME_DWELL_MS
+        int "Experimental mesh internal scan home dwell time (ms)"
+        range 0 1000
+        default 0
+
+    config MM_EXPERIMENTAL_MESH_FULL_SCAN_DWELL_MS
+        int "Experimental mesh pre-scan dwell time (ms)"
+        range 15 1000
+        default 120
+
+    config MM_EXPERIMENTAL_MESH_USE_SENSOR_STA
+        bool "Use SENSOR STA type in experimental mesh"
+        default n
+
+    config MM_MESH_DEBUG_LOG
+        bool "Enable mesh debug trace logs"
+        default n
+        help
+            Enable verbose mesh debug trace output from the application TX/RX
+            paths and Morse Micro framework (mesh_trace, MESH_TRACE_FLOW,
+            mesh_key).
+            Disable to suppress all mesh debug prints for cleaner logs.
+
+endif
+
+endmenu
+
+menu "HaLow Provisioning Configuration"
+
+    config HALOW_HINT_KEEP_PERCENT
+        int "HaLow hint channel keep ratio (%)"
+        range 1 100
+        default 100
+        help
+            Percentage of regulatory channels to keep in the fast-hint filtered
+            channel list. 100 keeps all channels (no filtering). Lower values
+            keep fewer channels nearest to the saved frequency hint.
+
+    config HALOW_VERBOSE_CHANNEL_LOG
+        bool "Verbose HaLow channel list logging"
+        default n
+        help
+            Enable detailed logging of full channel lists. Disable to reduce
+            UART log overhead and improve provisioning latency.
+
+    config HALOW_HINT_USE_BSSID_LOCK
+        bool "Use fast-hint BSSID lock on connect"
+        default n
+        help
+            When enabled and fast hint contains a valid BSSID, lock the initial
+            connection attempt to that BSSID for faster AP selection. If disabled,
+            connection remains flexible across BSSID changes.
+
+    config MM_EXPERIMENTAL_MESH_PREQ_INTERVAL_MS
+        int "Periodic HWMP PREQ broadcast interval (ms, 0=disabled)"
+        range 0 60000
+        default 4000
+        help
+            Interval in milliseconds for broadcasting proactive HWMP PREQ
+            frames.  This makes the ESP32 visible to remote mesh nodes and
+            establishes HWMP forwarding paths so the mesh root can route
+            IP traffic back to this node.  Set to 0 to disable.
+
+endmenu

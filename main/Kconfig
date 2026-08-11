@@ -1,0 +1,21 @@
+menu "EdgeZ HaLow Build Configuration"
+
+    choice EDGEZ_LIBRARY_MODE
+        prompt "HaLow driver build mode"
+        default USE_PREBUILT_EDGEZ
+
+        config BUILD_EDGEZ_FROM_SOURCE
+            bool "Build HaLow stack from mm-iot-esp32 source"
+            help
+                Compile EdgeZ mesh integration, MorseLib, HostAP, MM shims,
+                IP adaptation, utilities, and regulatory code from the pinned
+                third_party/mm-iot-esp32 source tree.
+
+        config USE_PREBUILT_EDGEZ
+            bool "Use packaged components/morse_halow/libmorse.a"
+            help
+                Link the packaged Morse archive and public headers from the
+                components/morse_halow component.
+    endchoice
+
+endmenu

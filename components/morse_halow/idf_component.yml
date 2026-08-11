@@ -1,0 +1,7 @@
+version: "0.1.0"
+description: Packaged Morse Micro Wi-Fi HaLow driver for EdgeZ ESP32-S3
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5.0"

@@ -1,0 +1,12 @@
+# ESP32-C6 Custom Partition Table for 8MB Flash (Dual OTA)
+# Name,   Type, SubType, Offset,  Size,    Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+ota_0,    app,  ota_0,   0x10000, 0x300000,
+ota_1,    app,  ota_1,   0x310000,0x300000,
+ota_data, data, ota,     0x7C0000,0x2000,
+nvs_key,  data, nvs_keys,0x7C2000,0x1000,
+driver_nvs, data, nvs,   0x7C3000,0x20000,
+factory_data, data, 0x40, 0x7E3000,0x1000,
+device_data, data, 0x41,  0x7E4000,0x10000,
+spiffs,   data, spiffs,  0x7F4000,0xC000,

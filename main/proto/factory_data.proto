@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package edge.device.factory;
+
+// Wi-Fi operation mode carried in factory data.
+enum WifiMode {
+  WIFI_MODE_UNSPECIFIED = 0;
+  WIFI_MODE_MESH = 1;
+  WIFI_MODE_STA = 2;
+  WIFI_MODE_WIFI = 3;
+  reserved 4;
+}
+
+// Supported country values for HaLow regulatory setup.
+enum CountryCode {
+  COUNTRY_UNSPECIFIED = 0;
+  COUNTRY_US = 1;
+  COUNTRY_CA = 2;
+  COUNTRY_JP = 3;
+  COUNTRY_AU = 4;
+  COUNTRY_NZ = 5;
+  COUNTRY_EU = 6;
+}
+
+message FactoryData {
+  WifiMode mode = 1;
+  CountryCode country = 2;
+  reserved 3;
+
+  // Device identity and key material provisioned at factory time.
+  string serial_number = 4;
+  bytes device_public_key = 5;
+  bytes device_private_key = 6;
+
+  // Signature over factory identity fields and the signer public key used to verify it.
+  bytes credential_signature = 7;
+  bytes signer_public_key = 8;
+
+  // Legacy Wi-Fi credentials kept for backward compatibility.
+  string ssid = 9;
+  string passphrase = 10;
+
+  // Six-digit BLE passkey printed or otherwise delivered with the device.
+  string ble_pin_code = 11;
+}
