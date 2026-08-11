@@ -1,0 +1,165 @@
+name: Build and publish ESP32S3 release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build or update (for example, v1.2.3)"
+        required: true
+        type: string
+      release_title:
+        description: "Release title"
+        required: true
+        type: string
+      release_notes:
+        description: "Release notes"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-release-${{ github.event.release.tag_name || inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      RELEASE_VERSION: ${{ github.event.release.tag_name || inputs.release_tag }}
+      RELEASE_TITLE: ${{ github.event.release.name || inputs.release_title || github.event.release.tag_name || inputs.release_tag }}
+      RELEASE_NOTES: ${{ github.event.release.body || inputs.release_notes }}
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+
+      - name: Verify packaged HaLow component
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          MORSE_ARCHIVE="components/morse_halow/lib/esp32s3/libmorse.a"
+          MORSE_BCF="components/morse_halow/bcf/bcf_mf08551.mbin"
+          if [[ ! -f "$MORSE_ARCHIVE" ]]; then
+            echo "::error::Prebuilt HaLow archive is missing: $MORSE_ARCHIVE"
+            exit 1
+          fi
+          if [[ ! -f "$MORSE_BCF" ]]; then
+            echo "::error::Board BCF is missing: $MORSE_BCF"
+            exit 1
+          fi
+
+      - name: Build merged and application binaries
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py --version
+
+          RAW_VERSION="${RELEASE_VERSION#refs/tags/}"
+          FW_VERSION="${RAW_VERSION#v}"
+          if [[ -z "$FW_VERSION" ]]; then
+            echo "::error::Unable to determine firmware version from $RELEASE_VERSION"
+            exit 1
+          fi
+
+          # Configure a reproducible release build against the packaged
+          # libmorse.a. All edits are confined to the disposable runner.
+          rm -f dependencies.lock sdkconfig sdkconfig.old
+          sed -i \
+            '/^CONFIG_LWM2M_DEVICE_FIRMWARE_VERSION=/d; /^CONFIG_BUILD_EDGEZ_FROM_SOURCE=/d; /^CONFIG_USE_PREBUILT_EDGEZ=/d; /^CONFIG_MM_MESH_DEBUG_LOG=/d; /^CONFIG_HALOW_VERBOSE_CHANNEL_LOG=/d' \
+            sdkconfig.defaults.esp32s3
+          printf '%s\n' \
+            "CONFIG_LWM2M_DEVICE_FIRMWARE_VERSION=\"$FW_VERSION\"" \
+            '# CONFIG_BUILD_EDGEZ_FROM_SOURCE is not set' \
+            'CONFIG_USE_PREBUILT_EDGEZ=y' \
+            'CONFIG_MM_MESH_DEBUG_LOG=n' \
+            'CONFIG_HALOW_VERBOSE_CHANNEL_LOG=n' \
+            >> sdkconfig.defaults.esp32s3
+
+          idf.py \
+            -DIDF_TARGET=esp32s3 \
+            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults.esp32s3" \
+            -DPROJECT_VER="$FW_VERSION" \
+            build
+
+          if ! grep -qx 'CONFIG_USE_PREBUILT_EDGEZ=y' sdkconfig; then
+            echo "::error::Release build did not select packaged libmorse.a"
+            exit 1
+          fi
+          if grep -qx 'CONFIG_BUILD_EDGEZ_FROM_SOURCE=y' sdkconfig; then
+            echo "::error::Release build unexpectedly selected private MM-IoT sources"
+            exit 1
+          fi
+          if grep -qx 'CONFIG_MM_MESH_DEBUG_LOG=y' sdkconfig ||
+             grep -qx 'CONFIG_HALOW_VERBOSE_CHANNEL_LOG=y' sdkconfig; then
+            echo "::error::Release build enabled development logging"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open("build/project_description.json", encoding="utf-8") as file:
+              project = json.load(file)
+
+          component_paths = {
+              os.path.realpath(path)
+              for path in project.get("build_component_paths", [])
+              if path
+          }
+          application = os.path.realpath("main")
+          driver = os.path.realpath("components/morse_halow")
+          if application not in component_paths or driver not in component_paths:
+              raise SystemExit(
+                  "Release build is missing the EdgeZ app or packaged HaLow component"
+              )
+          print(f"Confirmed EdgeZ application component: {application}")
+          print(f"Confirmed packaged HaLow component: {driver}")
+          PY
+
+          chmod +x ./make_merged_bin.sh
+          ./make_merged_bin.sh \
+            --skip-build \
+            --save-org-bin \
+            --output build/edge-device-esp32_merged.bin
+
+          # Preserve the stable web-flasher asset name and give the standalone
+          # application image an explicit public release name.
+          cp build/edge-device-esp32_merged.bin build/edge-device-esp32.bin
+          cp build/edge-device-esp32_org.bin build/edge-device-esp32_app.bin
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-device-esp32-${{ env.RELEASE_VERSION }}
+          path: |
+            build/edge-device-esp32.bin
+            build/edge-device-esp32_merged.bin
+            build/edge-device-esp32_app.bin
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload binaries to this repository release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: ${{ env.RELEASE_TITLE }}
+          body: ${{ env.RELEASE_NOTES }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            build/edge-device-esp32.bin
+            build/edge-device-esp32_merged.bin
+            build/edge-device-esp32_app.bin
