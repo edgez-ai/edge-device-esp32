@@ -27,6 +27,12 @@ PB_BIND(ai_edgez_halow_SensorData, ai_edgez_halow_SensorData, AUTO)
 PB_BIND(ai_edgez_halow_Peer, ai_edgez_halow_Peer, AUTO)
 
 
+PB_BIND(ai_edgez_halow_RouteEntry, ai_edgez_halow_RouteEntry, AUTO)
+
+
+PB_BIND(ai_edgez_halow_RoutingTable, ai_edgez_halow_RoutingTable, 2)
+
+
 PB_BIND(ai_edgez_halow_Beacon, ai_edgez_halow_Beacon, 2)
 
 

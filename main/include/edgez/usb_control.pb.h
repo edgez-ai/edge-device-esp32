@@ -163,12 +163,27 @@ typedef struct _ai_edgez_halow_Peer {
     int32_t rssi;
     pb_size_t sensor_data_count;
     ai_edgez_halow_SensorData sensor_data[7];
+    uint32_t route_tq; /* BATMAN-IV effective path quality, 0..255 */
+    uint32_t route_hops; /* Selected BATMAN-IV path length in radio links */
 } ai_edgez_halow_Peer;
 
 typedef struct _ai_edgez_halow_Report {
     pb_size_t peers_count;
     ai_edgez_halow_Peer peers[6];
 } ai_edgez_halow_Report;
+
+typedef struct _ai_edgez_halow_RouteEntry {
+    uint64_t destination;
+    uint64_t next_hop;
+    uint32_t tq;
+    uint32_t hops;
+    uint32_t age_ms;
+} ai_edgez_halow_RouteEntry;
+
+typedef struct _ai_edgez_halow_RoutingTable {
+    pb_size_t routes_count;
+    ai_edgez_halow_RouteEntry routes[16];
+} ai_edgez_halow_RoutingTable;
 
 typedef PB_BYTES_ARRAY_T(32) ai_edgez_halow_Beacon_user_public_key_t;
 typedef struct _ai_edgez_halow_Beacon {
@@ -201,6 +216,8 @@ typedef struct _ai_edgez_halow_HaLowInterfaceStatus {
     uint64_t mac_address;
     ai_edgez_halow_LicenseStatus license_status;
     char firmware_version[33];
+    bool has_public_channel_mask;
+    uint32_t public_channel_mask; /* bits 0..4 correspond to channels 1..5 */
 } ai_edgez_halow_HaLowInterfaceStatus;
 
 typedef PB_BYTES_ARRAY_T(32) ai_edgez_halow_HaLowInitConfig_user_public_key_t;
@@ -223,6 +240,8 @@ typedef struct _ai_edgez_halow_HaLowInitConfig {
     char sdk_compatibility[33];
     char sdk_release_id[33];
     ai_edgez_halow_HaLowInitConfig_sdk_release_signature_t sdk_release_signature;
+    uint32_t public_channel_mask; /* bits 0..4 correspond to channels 1..5 */
+    bool has_public_channel_mask;
 } ai_edgez_halow_HaLowInitConfig;
 
 typedef PB_BYTES_ARRAY_T(32) ai_edgez_halow_DeviceSettings_user_public_key_t;
@@ -290,6 +309,7 @@ typedef struct _ai_edgez_halow_NetworkPacket {
         ai_edgez_halow_Beacon beacon; /* beacon heard from the management Vendor IE */
         ai_edgez_halow_Report report;
         ai_edgez_halow_LocationUpdate location_update;
+        ai_edgez_halow_RoutingTable routing_table;
     } body;
 } ai_edgez_halow_NetworkPacket;
 
@@ -352,6 +372,8 @@ extern "C" {
 #define ai_edgez_halow_SensorData_type_ENUMTYPE ai_edgez_halow_SensorType
 
 
+
+
 #define ai_edgez_halow_Beacon_marker_ENUMTYPE ai_edgez_halow_MarkerColor
 #define ai_edgez_halow_Beacon_device_type_ENUMTYPE ai_edgez_halow_DeviceType
 
@@ -372,10 +394,12 @@ extern "C" {
 #define ai_edgez_halow_LocationUpdate_init_default {0, 0, 0}
 #define ai_edgez_halow_GeoFence_init_default     {0, 0, "", _ai_edgez_halow_MarkerColor_MIN, _ai_edgez_halow_AlertCondition_MIN, 0}
 #define ai_edgez_halow_SensorData_init_default   {_ai_edgez_halow_SensorType_MIN, 0, {0}}
-#define ai_edgez_halow_Peer_init_default         {0, 0, 0, {ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default}}
+#define ai_edgez_halow_Peer_init_default         {0, 0, 0, {ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default}, 0, 0}
+#define ai_edgez_halow_RouteEntry_init_default   {0, 0, 0, 0, 0}
+#define ai_edgez_halow_RoutingTable_init_default {0, {ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default, ai_edgez_halow_RouteEntry_init_default}}
 #define ai_edgez_halow_Beacon_init_default       {0, 0, "", {0, {0}}, 0, 0, _ai_edgez_halow_MarkerColor_MIN, _ai_edgez_halow_DeviceType_MIN, 0, false, ai_edgez_halow_GeoFence_init_default, 0, {ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default, ai_edgez_halow_SensorData_init_default}}
-#define ai_edgez_halow_HaLowInterfaceStatus_init_default {0, 0, 0, 0, 0, 0, 0, "", "", "", 0, _ai_edgez_halow_LicenseStatus_MIN, ""}
-#define ai_edgez_halow_HaLowInitConfig_init_default {"", "", "", 0, 0, 0, "", {0, {0}}, "", 0, 0, 0, 0, 0, "", "", {0, {0}}}
+#define ai_edgez_halow_HaLowInterfaceStatus_init_default {0, 0, 0, 0, 0, 0, 0, "", "", "", 0, _ai_edgez_halow_LicenseStatus_MIN, "", false, 0}
+#define ai_edgez_halow_HaLowInitConfig_init_default {"", "", "", 0, 0, 0, "", {0, {0}}, "", 0, 0, 0, 0, 0, "", "", {0, {0}}, 0, 0}
 #define ai_edgez_halow_DeviceSettings_init_default {_ai_edgez_halow_DeviceSettingsAction_MIN, 0, "", 0, "", _ai_edgez_halow_MarkerColor_MIN, 0, 0, 0, {0, {0}}, {0, {0}}, 0, 0, 0, false, ai_edgez_halow_GeoFence_init_default, "", "", 0, "", "", "", 0, _ai_edgez_halow_DeviceType_MIN, 0, 0}
 #define ai_edgez_halow_ScriptConfig_init_default {_ai_edgez_halow_ScriptConfigAction_MIN, 0, "", 0, 0, 0, {0, {0}}, "", 0, 0, 0, ""}
 #define ai_edgez_halow_MessageBody_init_zero     {0, 0, 0, _ai_edgez_halow_Mime_MIN, {0, {0}}, 0, 0}
@@ -384,10 +408,12 @@ extern "C" {
 #define ai_edgez_halow_LocationUpdate_init_zero  {0, 0, 0}
 #define ai_edgez_halow_GeoFence_init_zero        {0, 0, "", _ai_edgez_halow_MarkerColor_MIN, _ai_edgez_halow_AlertCondition_MIN, 0}
 #define ai_edgez_halow_SensorData_init_zero      {_ai_edgez_halow_SensorType_MIN, 0, {0}}
-#define ai_edgez_halow_Peer_init_zero            {0, 0, 0, {ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero}}
+#define ai_edgez_halow_Peer_init_zero            {0, 0, 0, {ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero}, 0, 0}
+#define ai_edgez_halow_RouteEntry_init_zero      {0, 0, 0, 0, 0}
+#define ai_edgez_halow_RoutingTable_init_zero    {0, {ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero, ai_edgez_halow_RouteEntry_init_zero}}
 #define ai_edgez_halow_Beacon_init_zero          {0, 0, "", {0, {0}}, 0, 0, _ai_edgez_halow_MarkerColor_MIN, _ai_edgez_halow_DeviceType_MIN, 0, false, ai_edgez_halow_GeoFence_init_zero, 0, {ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero, ai_edgez_halow_SensorData_init_zero}}
-#define ai_edgez_halow_HaLowInterfaceStatus_init_zero {0, 0, 0, 0, 0, 0, 0, "", "", "", 0, _ai_edgez_halow_LicenseStatus_MIN, ""}
-#define ai_edgez_halow_HaLowInitConfig_init_zero {"", "", "", 0, 0, 0, "", {0, {0}}, "", 0, 0, 0, 0, 0, "", "", {0, {0}}}
+#define ai_edgez_halow_HaLowInterfaceStatus_init_zero {0, 0, 0, 0, 0, 0, 0, "", "", "", 0, _ai_edgez_halow_LicenseStatus_MIN, "", false, 0}
+#define ai_edgez_halow_HaLowInitConfig_init_zero {"", "", "", 0, 0, 0, "", {0, {0}}, "", 0, 0, 0, 0, 0, "", "", {0, {0}}, 0, 0}
 #define ai_edgez_halow_DeviceSettings_init_zero  {_ai_edgez_halow_DeviceSettingsAction_MIN, 0, "", 0, "", _ai_edgez_halow_MarkerColor_MIN, 0, 0, 0, {0, {0}}, {0, {0}}, 0, 0, 0, false, ai_edgez_halow_GeoFence_init_zero, "", "", 0, "", "", "", 0, _ai_edgez_halow_DeviceType_MIN, 0, 0}
 #define ai_edgez_halow_ScriptConfig_init_zero    {_ai_edgez_halow_ScriptConfigAction_MIN, 0, "", 0, 0, 0, {0, {0}}, "", 0, 0, 0, ""}
 
@@ -415,7 +441,15 @@ extern "C" {
 #define ai_edgez_halow_Peer_id_tag               1
 #define ai_edgez_halow_Peer_rssi_tag             2
 #define ai_edgez_halow_Peer_sensor_data_tag      3
+#define ai_edgez_halow_Peer_route_tq_tag         4
+#define ai_edgez_halow_Peer_route_hops_tag       5
 #define ai_edgez_halow_Report_peers_tag          1
+#define ai_edgez_halow_RouteEntry_destination_tag 1
+#define ai_edgez_halow_RouteEntry_next_hop_tag   2
+#define ai_edgez_halow_RouteEntry_tq_tag         3
+#define ai_edgez_halow_RouteEntry_hops_tag       4
+#define ai_edgez_halow_RouteEntry_age_ms_tag     5
+#define ai_edgez_halow_RoutingTable_routes_tag   1
 #define ai_edgez_halow_Beacon_user_id_high_tag   1
 #define ai_edgez_halow_Beacon_user_id_low_tag    2
 #define ai_edgez_halow_Beacon_user_name_tag      3
@@ -440,6 +474,7 @@ extern "C" {
 #define ai_edgez_halow_HaLowInterfaceStatus_mac_address_tag 11
 #define ai_edgez_halow_HaLowInterfaceStatus_license_status_tag 12
 #define ai_edgez_halow_HaLowInterfaceStatus_firmware_version_tag 13
+#define ai_edgez_halow_HaLowInterfaceStatus_public_channel_mask_tag 14
 #define ai_edgez_halow_HaLowInitConfig_country_code_tag 1
 #define ai_edgez_halow_HaLowInitConfig_mesh_id_tag 2
 #define ai_edgez_halow_HaLowInitConfig_passphrase_tag 3
@@ -457,6 +492,8 @@ extern "C" {
 #define ai_edgez_halow_HaLowInitConfig_sdk_compatibility_tag 15
 #define ai_edgez_halow_HaLowInitConfig_sdk_release_id_tag 16
 #define ai_edgez_halow_HaLowInitConfig_sdk_release_signature_tag 17
+#define ai_edgez_halow_HaLowInitConfig_public_channel_mask_tag 18
+#define ai_edgez_halow_HaLowInitConfig_has_public_channel_mask_tag 19
 #define ai_edgez_halow_DeviceSettings_action_tag 1
 #define ai_edgez_halow_DeviceSettings_device_mode_enabled_tag 2
 #define ai_edgez_halow_DeviceSettings_mesh_id_tag 3
@@ -507,6 +544,7 @@ extern "C" {
 #define ai_edgez_halow_NetworkPacket_beacon_tag  106
 #define ai_edgez_halow_NetworkPacket_report_tag  107
 #define ai_edgez_halow_NetworkPacket_location_update_tag 108
+#define ai_edgez_halow_NetworkPacket_routing_table_tag 109
 
 /* Struct field encoding specification for nanopb */
 #define ai_edgez_halow_MessageBody_FIELDLIST(X, a) \
@@ -539,7 +577,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,device_settings,body.device_settings), 
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,script_config,body.script_config), 105) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,beacon,body.beacon), 106) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,report,body.report), 107) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,location_update,body.location_update), 108)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,location_update,body.location_update), 108) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,routing_table,body.routing_table), 109)
 #define ai_edgez_halow_NetworkPacket_CALLBACK NULL
 #define ai_edgez_halow_NetworkPacket_DEFAULT NULL
 #define ai_edgez_halow_NetworkPacket_body_msg_MSGTYPE ai_edgez_halow_MessageBody
@@ -550,6 +589,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (body,location_update,body.location_update), 
 #define ai_edgez_halow_NetworkPacket_body_beacon_MSGTYPE ai_edgez_halow_Beacon
 #define ai_edgez_halow_NetworkPacket_body_report_MSGTYPE ai_edgez_halow_Report
 #define ai_edgez_halow_NetworkPacket_body_location_update_MSGTYPE ai_edgez_halow_LocationUpdate
+#define ai_edgez_halow_NetworkPacket_body_routing_table_MSGTYPE ai_edgez_halow_RoutingTable
 
 #define ai_edgez_halow_LocationUpdate_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, FLOAT,    latitude,          1) \
@@ -579,10 +619,27 @@ X(a, STATIC,   ONEOF,    FLOAT,    (value,float_value,value.float_value),   4)
 #define ai_edgez_halow_Peer_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT64,   id,                1) \
 X(a, STATIC,   SINGULAR, SINT32,   rssi,              2) \
-X(a, STATIC,   REPEATED, MESSAGE,  sensor_data,       3)
+X(a, STATIC,   REPEATED, MESSAGE,  sensor_data,       3) \
+X(a, STATIC,   SINGULAR, UINT32,   route_tq,          4) \
+X(a, STATIC,   SINGULAR, UINT32,   route_hops,        5)
 #define ai_edgez_halow_Peer_CALLBACK NULL
 #define ai_edgez_halow_Peer_DEFAULT NULL
 #define ai_edgez_halow_Peer_sensor_data_MSGTYPE ai_edgez_halow_SensorData
+
+#define ai_edgez_halow_RouteEntry_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT64,   destination,       1) \
+X(a, STATIC,   SINGULAR, UINT64,   next_hop,          2) \
+X(a, STATIC,   SINGULAR, UINT32,   tq,                3) \
+X(a, STATIC,   SINGULAR, UINT32,   hops,              4) \
+X(a, STATIC,   SINGULAR, UINT32,   age_ms,            5)
+#define ai_edgez_halow_RouteEntry_CALLBACK NULL
+#define ai_edgez_halow_RouteEntry_DEFAULT NULL
+
+#define ai_edgez_halow_RoutingTable_FIELDLIST(X, a) \
+X(a, STATIC,   REPEATED, MESSAGE,  routes,            1)
+#define ai_edgez_halow_RoutingTable_CALLBACK NULL
+#define ai_edgez_halow_RoutingTable_DEFAULT NULL
+#define ai_edgez_halow_RoutingTable_routes_MSGTYPE ai_edgez_halow_RouteEntry
 
 #define ai_edgez_halow_Beacon_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT64,   user_id_high,      1) \
@@ -614,7 +671,8 @@ X(a, STATIC,   SINGULAR, STRING,   ip_addr,           9) \
 X(a, STATIC,   SINGULAR, STRING,   gateway,          10) \
 X(a, STATIC,   SINGULAR, UINT64,   mac_address,      11) \
 X(a, STATIC,   SINGULAR, UENUM,    license_status,   12) \
-X(a, STATIC,   SINGULAR, STRING,   firmware_version,  13)
+X(a, STATIC,   SINGULAR, STRING,   firmware_version,  13) \
+X(a, STATIC,   OPTIONAL, UINT32,   public_channel_mask,  14)
 #define ai_edgez_halow_HaLowInterfaceStatus_CALLBACK NULL
 #define ai_edgez_halow_HaLowInterfaceStatus_DEFAULT NULL
 
@@ -635,7 +693,9 @@ X(a, STATIC,   SINGULAR, UINT32,   mesh_bandwidth_mhz,  13) \
 X(a, STATIC,   SINGULAR, UINT32,   mesh_frequency_khz,  14) \
 X(a, STATIC,   SINGULAR, STRING,   sdk_compatibility,  15) \
 X(a, STATIC,   SINGULAR, STRING,   sdk_release_id,   16) \
-X(a, STATIC,   SINGULAR, BYTES,    sdk_release_signature,  17)
+X(a, STATIC,   SINGULAR, BYTES,    sdk_release_signature,  17) \
+X(a, STATIC,   SINGULAR, UINT32,   public_channel_mask,  18) \
+X(a, STATIC,   SINGULAR, BOOL,     has_public_channel_mask,  19)
 #define ai_edgez_halow_HaLowInitConfig_CALLBACK NULL
 #define ai_edgez_halow_HaLowInitConfig_DEFAULT NULL
 
@@ -692,6 +752,8 @@ extern const pb_msgdesc_t ai_edgez_halow_LocationUpdate_msg;
 extern const pb_msgdesc_t ai_edgez_halow_GeoFence_msg;
 extern const pb_msgdesc_t ai_edgez_halow_SensorData_msg;
 extern const pb_msgdesc_t ai_edgez_halow_Peer_msg;
+extern const pb_msgdesc_t ai_edgez_halow_RouteEntry_msg;
+extern const pb_msgdesc_t ai_edgez_halow_RoutingTable_msg;
 extern const pb_msgdesc_t ai_edgez_halow_Beacon_msg;
 extern const pb_msgdesc_t ai_edgez_halow_HaLowInterfaceStatus_msg;
 extern const pb_msgdesc_t ai_edgez_halow_HaLowInitConfig_msg;
@@ -706,6 +768,8 @@ extern const pb_msgdesc_t ai_edgez_halow_ScriptConfig_msg;
 #define ai_edgez_halow_GeoFence_fields &ai_edgez_halow_GeoFence_msg
 #define ai_edgez_halow_SensorData_fields &ai_edgez_halow_SensorData_msg
 #define ai_edgez_halow_Peer_fields &ai_edgez_halow_Peer_msg
+#define ai_edgez_halow_RouteEntry_fields &ai_edgez_halow_RouteEntry_msg
+#define ai_edgez_halow_RoutingTable_fields &ai_edgez_halow_RoutingTable_msg
 #define ai_edgez_halow_Beacon_fields &ai_edgez_halow_Beacon_msg
 #define ai_edgez_halow_HaLowInterfaceStatus_fields &ai_edgez_halow_HaLowInterfaceStatus_msg
 #define ai_edgez_halow_HaLowInitConfig_fields &ai_edgez_halow_HaLowInitConfig_msg
@@ -717,13 +781,15 @@ extern const pb_msgdesc_t ai_edgez_halow_ScriptConfig_msg;
 #define ai_edgez_halow_Beacon_size               316
 #define ai_edgez_halow_DeviceSettings_size       587
 #define ai_edgez_halow_GeoFence_size             98
-#define ai_edgez_halow_HaLowInitConfig_size      410
-#define ai_edgez_halow_HaLowInterfaceStatus_size 133
+#define ai_edgez_halow_HaLowInitConfig_size      420
+#define ai_edgez_halow_HaLowInterfaceStatus_size 139
 #define ai_edgez_halow_LocationUpdate_size       21
 #define ai_edgez_halow_MessageBody_size          475
-#define ai_edgez_halow_NetworkPacket_size        617
-#define ai_edgez_halow_Peer_size                 87
-#define ai_edgez_halow_Report_size               534
+#define ai_edgez_halow_NetworkPacket_size        702
+#define ai_edgez_halow_Peer_size                 99
+#define ai_edgez_halow_Report_size               606
+#define ai_edgez_halow_RouteEntry_size           40
+#define ai_edgez_halow_RoutingTable_size         672
 #define ai_edgez_halow_ScriptConfig_size         425
 #define ai_edgez_halow_SensorData_size           8
 

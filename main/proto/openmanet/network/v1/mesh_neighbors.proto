@@ -1,0 +1,35 @@
+// Vendored from OpenMANET/protobufs commit ae3e237214be178a114e564f84f3c233a51f8f01.
+syntax = "proto3";
+
+package openmanet.network.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Alfred datatype 103: a node's direct neighbors and best-route view.
+message MeshNeighbors {
+  string primary_mac = 1;
+  string hostname = 2;
+  int32 algorithm = 3;
+  repeated MeshNeighbor neighbors = 4;
+  google.protobuf.Timestamp collected_at = 5;
+  repeated Originator originators = 6;
+  repeated string interface_macs = 7;
+}
+
+message MeshNeighbor {
+  string mac = 1;
+  string hard_ifname = 2;
+  bool blos = 3;
+  int32 last_seen_msecs = 4;
+  int64 throughput_kbps = 5;
+  int32 tq = 6;
+}
+
+message Originator {
+  string orig_mac = 1;
+  string next_hop_mac = 2;
+  int32 hops = 3;
+  string hard_ifname = 4;
+  int64 throughput_kbps = 5;
+  int32 tq = 6;
+}

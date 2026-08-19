@@ -1,0 +1,20 @@
+openmanet.network.v1.AddressReservation.mac type:FT_STATIC max_length:17
+openmanet.network.v1.AddressReservation.static_ip type:FT_STATIC max_length:45
+openmanet.network.v1.AddressReservation.reservation_cidr type:FT_STATIC max_length:48
+openmanet.network.v1.AddressReservation.uci_dhcp_start type:FT_STATIC max_length:15
+openmanet.network.v1.AddressReservation.uci_dhcp_limit type:FT_STATIC max_length:15
+openmanet.network.v1.Node.mac type:FT_STATIC max_length:17
+openmanet.network.v1.Node.hostname type:FT_STATIC max_length:64
+openmanet.network.v1.Node.ipaddr type:FT_STATIC max_length:45
+openmanet.network.v1.Node.uci_dhcp_start type:FT_STATIC max_length:15
+openmanet.network.v1.Node.uci_dhcp_limit type:FT_STATIC max_length:15
+openmanet.network.v1.MeshNeighbors.primary_mac type:FT_STATIC max_length:17
+openmanet.network.v1.MeshNeighbors.hostname type:FT_STATIC max_length:64
+openmanet.network.v1.MeshNeighbors.neighbors type:FT_STATIC max_count:8
+openmanet.network.v1.MeshNeighbors.originators type:FT_STATIC max_count:8
+openmanet.network.v1.MeshNeighbors.interface_macs type:FT_STATIC max_count:4 max_length:17
+openmanet.network.v1.MeshNeighbor.mac type:FT_STATIC max_length:17
+openmanet.network.v1.MeshNeighbor.hard_ifname type:FT_STATIC max_length:15
+openmanet.network.v1.Originator.orig_mac type:FT_STATIC max_length:17
+openmanet.network.v1.Originator.next_hop_mac type:FT_STATIC max_length:17
+openmanet.network.v1.Originator.hard_ifname type:FT_STATIC max_length:15

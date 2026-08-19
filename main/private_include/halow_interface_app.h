@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "edgez_platform.h"
 #include "network_transport.h"
 #include "prov.h"
 
@@ -77,6 +78,28 @@ esp_err_t halow_interface_app_forward_mesh_payload(const uint8_t *payload,
                                                    uint32_t sequence,
                                                    uint32_t hop);
 bool halow_interface_app_get_self_mac(uint8_t mac[6]);
+bool halow_interface_app_lookup_batman_route(const uint8_t destination[6],
+                                              uint8_t next_hop[6],
+                                              uint8_t *hop_count,
+                                              uint8_t *tq,
+                                              uint32_t *route_age_ms);
+size_t halow_interface_app_get_batman_routes(edgez_platform_halow_route_t *routes,
+                                              size_t capacity);
+bool halow_interface_app_select_batman_direct_peer(const uint8_t exclude_a[6],
+                                                    const uint8_t exclude_b[6],
+                                                    const uint8_t exclude_c[6],
+                                                    uint64_t selection_key,
+                                                    uint8_t peer[6]);
+void halow_interface_app_note_foreground_traffic(void);
+bool halow_interface_app_foreground_traffic_active(void);
+esp_err_t halow_interface_app_send_batman_payload(const uint8_t destination[6],
+                                                   const uint8_t *payload,
+                                                   size_t payload_len);
+esp_err_t halow_interface_app_send_batman_broadcast_payload(
+    const uint8_t *payload, size_t payload_len);
+bool halow_interface_app_handle_batman_rx(const uint8_t *ethernet_frame,
+                                           size_t frame_len,
+                                           const uint8_t transmitter[6]);
 void halow_interface_app_get_status(wifi_prov_halow_status_t *out_status);
 bool halow_interface_app_ready(void);
 bool halow_interface_app_mesh_initialized(void);

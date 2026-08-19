@@ -1,0 +1,29 @@
+// Vendored from OpenMANET/protobufs commit ae3e237214be178a114e564f84f3c233a51f8f01.
+syntax = "proto3";
+
+package openmanet.network.v1;
+
+message AddressReservation {
+  option deprecated = true;
+  string mac = 1;
+  string static_ip = 2;
+  string reservation_cidr = 3;
+  string uci_dhcp_start = 4;
+  string uci_dhcp_limit = 5;
+  bool requesting_reservation = 6;
+}
+
+message Node {
+  string mac = 1;
+  string hostname = 2;
+  string ipaddr = 3;
+  Position position = 4;
+  string uci_dhcp_start = 5;
+  string uci_dhcp_limit = 6;
+}
+
+message Position {
+  double latitude = 1;
+  double longitude = 2;
+  float altitude = 3;
+}

@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "halow_sync_bridge.h"
 #include "log_stream_protocol.h"
+#include "openmanet_comms.h"
 
 #define USB_RX_BUFFER_SIZE (EDGEZ_FRAME_MAX_LEN * 64)
 #define USB_IO_TIMEOUT_MS 1000
@@ -450,8 +451,9 @@ static bool usb_enter_control_mode_with_pong(uint16_t sequence,
         atomic_store_explicit(&s_last_host_activity_ms, usb_now_ms(),
                               memory_order_release);
         halow_sync_bridge_note_usb_connected(true);
-        halow_sync_bridge_set_log_stream_enabled(true);
-        halow_sync_bridge_request_log_level_test();
+        bool stream_logs = nonce[USB_HANDSHAKE_NONCE_LEN] != ESP_LOG_NONE;
+        halow_sync_bridge_set_log_stream_enabled(stream_logs);
+        if (stream_logs) halow_sync_bridge_request_log_level_test();
     }
     return ok;
 }
@@ -519,6 +521,7 @@ static void usb_set_log_level(uint8_t requested_level,
     }
     esp_log_level_set(tag, (esp_log_level_t)effective_level);
     usb_apply_log_exclusions();
+    /* Queue the command response even when NONE turns the stream off. */
     halow_sync_bridge_set_log_stream_enabled(true);
     uint16_t response_tag_len = (uint16_t)strlen(tag);
     uint8_t response[EDGEZ_LOG_STREAM_HEADER_LEN + sizeof(tag)] = {
@@ -529,7 +532,11 @@ static void usb_set_log_level(uint8_t requested_level,
     memcpy(&response[EDGEZ_LOG_STREAM_HEADER_LEN], tag, response_tag_len);
     (void)halow_sync_bridge_queue_log_frame(
         response, (uint16_t)(EDGEZ_LOG_STREAM_HEADER_LEN + response_tag_len));
-    halow_sync_bridge_request_log_level_test();
+    if (effective_level == ESP_LOG_NONE) {
+        halow_sync_bridge_set_log_stream_enabled(false);
+    } else {
+        halow_sync_bridge_request_log_level_test();
+    }
 }
 
 static void usb_update_mobile_gap_from_pressure(void)
@@ -563,8 +570,14 @@ static void usb_process_payload(const uint8_t *payload, uint16_t payload_len)
 {
     if (payload_len > USB_PROTOCOL_HEADER_LEN &&
         memcmp(payload, s_voice_magic, USB_PROTOCOL_HEADER_LEN) == 0) {
-        esp_err_t err = halow_sync_bridge_handle_voice_to_radio(
-            payload + USB_PROTOCOL_HEADER_LEN, payload_len - USB_PROTOCOL_HEADER_LEN);
+        const uint8_t *realtime = payload + USB_PROTOCOL_HEADER_LEN;
+        size_t realtime_len = payload_len - USB_PROTOCOL_HEADER_LEN;
+        esp_err_t err = realtime_len > OPENMANET_COMMS_MAGIC_LEN &&
+                        memcmp(realtime, "OMC", OPENMANET_COMMS_MAGIC_LEN - 1U) == 0 &&
+                        (realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 1U ||
+                         realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 2U)
+            ? openmanet_comms_send_phone_frame(realtime, realtime_len)
+            : halow_sync_bridge_handle_voice_to_radio(realtime, realtime_len);
         if (err == ESP_OK) {
             usb_send_legacy_echo(USB_LEGACY_TX_ACK, 0, NULL, 0);
         }

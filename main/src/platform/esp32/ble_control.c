@@ -28,6 +28,7 @@
 #include "edgez_frame_protocol.h"
 #include "factory_data.h"
 #include "halow_sync_bridge.h"
+#include "openmanet_comms.h"
 #include "log_stream_protocol.h"
 #include "usb_control_transport.h"
 
@@ -605,12 +606,17 @@ static bool ble_control_handle_log_command(const uint8_t *payload,
     if (response_tag_len > 0) {
         memcpy(&response[EDGEZ_LOG_STREAM_HEADER_LEN], tag, response_tag_len);
     }
+    /* Level NONE is also the explicit stream-off command. Temporarily allow
+     * the response into the asynchronous mobile queue, then stop capturing
+     * new ESP_LOG records before this function returns. */
     if (level_applied) {
         halow_sync_bridge_set_log_stream_enabled(true);
     }
     (void)halow_sync_bridge_queue_log_frame(
         response, EDGEZ_LOG_STREAM_HEADER_LEN + response_tag_len);
-    if (level_applied) {
+    if (level_applied && effective_level == ESP_LOG_NONE) {
+        halow_sync_bridge_set_log_stream_enabled(false);
+    } else if (level_applied) {
         halow_sync_bridge_request_log_level_test();
     }
     return true;
@@ -727,9 +733,14 @@ static int ble_control_gatt_access(uint16_t conn_handle,
         }
         esp_err_t err;
         if (memcmp(packet, s_ble_voice_protocol_magic, BLE_VOICE_PROTOCOL_HEADER_LEN) == 0) {
-            err = halow_sync_bridge_handle_voice_to_radio(
-                &packet[BLE_VOICE_PROTOCOL_HEADER_LEN],
-                copied - BLE_VOICE_PROTOCOL_HEADER_LEN);
+            const uint8_t *realtime = &packet[BLE_VOICE_PROTOCOL_HEADER_LEN];
+            size_t realtime_len = copied - BLE_VOICE_PROTOCOL_HEADER_LEN;
+            err = realtime_len > OPENMANET_COMMS_MAGIC_LEN &&
+                  memcmp(realtime, "OMC", OPENMANET_COMMS_MAGIC_LEN - 1U) == 0 &&
+                  (realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 1U ||
+                   realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 2U)
+                ? openmanet_comms_send_phone_frame(realtime, realtime_len)
+                : halow_sync_bridge_handle_voice_to_radio(realtime, realtime_len);
         } else if (memcmp(packet, s_ble_speed_protocol_magic, BLE_VOICE_PROTOCOL_HEADER_LEN) == 0) {
             err = halow_sync_bridge_handle_speed_to_radio(
                 &packet[BLE_VOICE_PROTOCOL_HEADER_LEN],
@@ -840,6 +851,12 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.attr_handle,
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
+        if (s_ble_secured && event->subscribe.cur_indicate) {
+            /* Pairing completes before Android enables the control CCC. Wake
+             * the bridge only after indications are writable so the initial
+             * device-settings/status pair cannot be lost in that race. */
+            halow_sync_bridge_request_status_report();
+        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
