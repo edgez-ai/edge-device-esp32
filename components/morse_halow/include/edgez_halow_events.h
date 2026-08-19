@@ -19,6 +19,8 @@ typedef enum {
     EDGEZ_HALOW_EVENT_RX_FRAME = 1,
     EDGEZ_HALOW_EVENT_BEACON,
     EDGEZ_HALOW_EVENT_PEER_ADMISSION,
+    EDGEZ_HALOW_EVENT_BATMAN_PEER,
+    EDGEZ_HALOW_EVENT_BATMAN_PAYLOAD,
 } edgez_halow_event_type_t;
 
 typedef struct {
@@ -44,6 +46,18 @@ typedef struct {
             uint16_t ies_len;
             uint8_t ies[EDGEZ_HALOW_EVENT_IES_MAX];
         } peer_admission;
+        struct {
+            uint8_t originator[6];
+            uint8_t last_sender[6];
+            int32_t rssi_dbm;
+            uint32_t sequence;
+            bool direct;
+        } batman_peer;
+        struct {
+            uint16_t payload_len;
+            uint8_t originator[6];
+            uint8_t payload[EDGEZ_HALOW_EVENT_PAYLOAD_MAX];
+        } batman_payload;
     } data;
 } edgez_halow_event_t;
 

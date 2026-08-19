@@ -16,7 +16,8 @@ The board BCF remains outside the archive at
 
 It currently contains:
 
-- mesh routing, forwarding, hop limiting and duplicate suppression;
+- BATMAN-IV next-hop routing plus EdgeZ forwarding, hop limiting and duplicate
+  suppression;
 - reliable delivery, acknowledgement and retry state;
 - beacon encoding, decoding and peer topology tracking;
 - voice and global-buffer routing;

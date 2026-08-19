@@ -3034,11 +3034,23 @@ static void halow_mmwlan_rx_to_lwip(struct mmpkt *rxpkt,
         return;
     }
 
+    /* mmwlan permits only one effective RX callback. This extended callback
+     * overrides HaLowInterface's legacy callback, so consume BATMAN_IV here
+     * before passing ordinary Ethernet traffic to the EdgeZ bridge/lwIP. */
+    if (halow_interface_app_handle_batman_rx(
+            payload, payload_len, metadata ? metadata->ta : NULL))
+    {
+        mmpkt_close(&pktview);
+        mmpkt_release(rxpkt);
+        return;
+    }
+
     if (halow_sync_bridge_handle_rx_frame(payload,
                                           14,
                                           payload + 14,
                                           payload_len - 14,
-                                          metadata ? metadata->ta : NULL)) {
+                                          metadata ? metadata->ta : NULL,
+                                          false)) {
         mmpkt_close(&pktview);
         mmpkt_release(rxpkt);
         return;

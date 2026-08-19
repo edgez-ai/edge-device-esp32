@@ -150,7 +150,11 @@ static void init_halow_control_plane(void)
         return;
     }
 
+#if CONFIG_EDGEZ_CUSTOM_USB_CONTROL
     ESP_LOGI(TAG, "HaLow control plane ready; waiting for BLE/USB INIT_HALOW");
+#else
+    ESP_LOGI(TAG, "HaLow control plane ready; waiting for BLE INIT_HALOW (USB transport disabled)");
+#endif
 }
 
 void edgez_app_run(void)
@@ -261,7 +265,11 @@ void edgez_app_run(void)
     }
 #endif
 
+#if CONFIG_EDGEZ_CUSTOM_USB_CONTROL
     ESP_LOGI(TAG, "Starting BLE/USB-owned HaLow control plane");
+#else
+    ESP_LOGI(TAG, "Starting BLE-owned HaLow control plane");
+#endif
     init_halow_control_plane();
     ESP_LOGI(TAG, "Edge device initialization complete");
 }

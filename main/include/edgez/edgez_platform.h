@@ -45,6 +45,14 @@ typedef struct {
 } edgez_platform_halow_status_t;
 
 typedef struct {
+    uint8_t originator[6];
+    uint8_t next_hop[6];
+    uint8_t tq;
+    uint8_t hops;
+    uint32_t age_ms;
+} edgez_platform_halow_route_t;
+
+typedef struct {
     bool has_latitude;
     bool has_longitude;
     bool has_altitude;
@@ -125,6 +133,17 @@ typedef struct {
     esp_err_t (*halow_init)(void);
     bool (*halow_ready)(void);
     bool (*halow_get_self_mac)(uint8_t mac[6]);
+    bool (*halow_lookup_route)(const uint8_t destination[6], uint8_t next_hop[6],
+                               uint8_t *hop_count, uint8_t *tq,
+                               uint32_t *route_age_ms);
+    size_t (*halow_get_routes)(edgez_platform_halow_route_t *routes,
+                               size_t capacity);
+    bool (*halow_select_direct_peer)(const uint8_t exclude_a[6],
+                                     const uint8_t exclude_b[6],
+                                     const uint8_t exclude_c[6],
+                                     uint64_t selection_key, uint8_t peer[6]);
+    void (*halow_note_foreground_traffic)(void);
+    bool (*halow_foreground_traffic_active)(void);
     void (*halow_get_status)(edgez_platform_halow_status_t *out_status);
     esp_err_t (*halow_set_user_identity)(uint64_t user_id_high, uint64_t user_id_low,
                                          const char *user_name,

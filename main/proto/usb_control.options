@@ -3,6 +3,7 @@ ai.edgez.halow.Beacon.user_public_key type:FT_STATIC max_size:32
 ai.edgez.halow.Beacon.sensor_data type:FT_STATIC max_count:7
 ai.edgez.halow.Peer.sensor_data type:FT_STATIC max_count:7
 ai.edgez.halow.Report.peers type:FT_STATIC max_count:6
+ai.edgez.halow.RoutingTable.routes type:FT_STATIC max_count:16
 ai.edgez.halow.GeoFence.name type:FT_STATIC max_length:64
 ai.edgez.halow.NetworkPacket.payload type:FT_STATIC max_size:440
 ai.edgez.halow.MessageBody.payload type:FT_STATIC max_size:420

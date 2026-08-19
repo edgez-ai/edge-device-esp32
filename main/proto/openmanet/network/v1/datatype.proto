@@ -1,0 +1,13 @@
+// Vendored from OpenMANET/protobufs commit ae3e237214be178a114e564f84f3c233a51f8f01.
+syntax = "proto3";
+
+package openmanet.network.v1;
+
+// Alfred data types used to distribute OpenMANET records across the mesh.
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
+  DATA_TYPE_GATEWAY = 100;
+  DATA_TYPE_ADDRESS_RESERVATION = 101 [deprecated = true];
+  DATA_TYPE_NODE = 102;
+  DATA_TYPE_MESH_NEIGHBORS = 103;
+}

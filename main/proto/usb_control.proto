@@ -107,6 +107,7 @@ message NetworkPacket {
     Beacon beacon = 106; // beacon heard from the management Vendor IE
     Report report = 107;
     LocationUpdate location_update = 108;
+    RoutingTable routing_table = 109;
   }
 }
 
@@ -174,6 +175,20 @@ message Peer {
   uint64 id = 1;
   sint32 rssi = 2;
   repeated SensorData sensor_data = 3;
+  uint32 route_tq = 4;    // BATMAN-IV effective path quality, 0..255
+  uint32 route_hops = 5;  // Selected BATMAN-IV path length in radio links
+}
+
+message RouteEntry {
+  uint64 destination = 1;
+  uint64 next_hop = 2;
+  uint32 tq = 3;
+  uint32 hops = 4;
+  uint32 age_ms = 5;
+}
+
+message RoutingTable {
+  repeated RouteEntry routes = 1;
 }
 
 message Beacon {
@@ -205,6 +220,7 @@ message HaLowInterfaceStatus {
   uint64 mac_address = 11;
   LicenseStatus license_status = 12;
   string firmware_version = 13;
+  optional uint32 public_channel_mask = 14; // bits 0..4 correspond to channels 1..5
 }
 
 
@@ -227,6 +243,8 @@ message HaLowInitConfig {
   string sdk_compatibility = 15;
   string sdk_release_id = 16;
   bytes sdk_release_signature = 17;
+  uint32 public_channel_mask = 18; // bits 0..4 correspond to channels 1..5
+  bool has_public_channel_mask = 19;
 }
 
 message DeviceSettings {

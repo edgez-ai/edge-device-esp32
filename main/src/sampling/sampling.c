@@ -392,7 +392,8 @@ static void build_default_sample_payload(char *out, size_t out_size, const char 
 static void sample_ring_push_payload(const char *payload, size_t len);
 static esp_err_t sample_script_cache_set_capacity(size_t capacity);
 static esp_err_t sample_script_cache_ensure_capacity(size_t min_capacity);
-static esp_err_t sample_ring_ensure_slot_storage(uint8_t slot_index);
+static esp_err_t sample_ring_ensure_slot_storage(uint8_t slot_index,
+                                                 size_t required_len);
 
 static uint32_t sample_retry_delay_with_jitter_ms(uint32_t base_delay_ms, uint32_t attempt_index)
 {
@@ -2724,6 +2725,7 @@ RTC_DATA_ATTR uint64_t s_next_sample_due_us = 0;
 
 typedef struct {
     uint32_t len;
+    uint32_t capacity;
     uint8_t *payload;
 } sample_ring_record_t;
 
@@ -2732,28 +2734,48 @@ static uint8_t s_sample_ring_head = 0;
 static uint8_t s_sample_ring_tail = 0;
 static uint8_t s_sample_ring_count = 0;
 
-static esp_err_t sample_ring_ensure_slot_storage(uint8_t slot_index)
+static esp_err_t sample_ring_ensure_slot_storage(uint8_t slot_index,
+                                                 size_t required_len)
 {
-    if (slot_index >= SAMPLE_RING_MAX_RECORDS) {
+    if (slot_index >= SAMPLE_RING_MAX_RECORDS || required_len == 0 ||
+        required_len > SAMPLE_RING_RECORD_MAX_LEN) {
         return ESP_ERR_INVALID_ARG;
     }
 
     sample_ring_record_t *slot = &s_sample_ring[slot_index];
-    if (slot->payload) {
+    if (slot->payload && slot->capacity >= required_len) {
         return ESP_OK;
     }
 
-    slot->payload = (uint8_t *)heap_caps_malloc(SAMPLE_RING_RECORD_MAX_LEN,
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!slot->payload) {
+    /* Small sensor records are normally only tens of bytes. Grow slots in
+     * powers of two instead of reserving 256 KiB for every ring position. */
+    size_t target_capacity = slot->capacity ? slot->capacity : 256U;
+    while (target_capacity < required_len) {
+        size_t next = target_capacity * 2U;
+        if (next <= target_capacity || next > SAMPLE_RING_RECORD_MAX_LEN) {
+            target_capacity = SAMPLE_RING_RECORD_MAX_LEN;
+            break;
+        }
+        target_capacity = next;
+    }
+
+    uint8_t *next_payload = (uint8_t *)heap_caps_realloc(
+        slot->payload, target_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!next_payload) {
         ESP_LOGE(TAG,
-                 "sample ring PSRAM allocation failed slot=%u size=%u",
+                 "sample ring PSRAM allocation failed slot=%u requested=%u capacity=%u",
                  (unsigned)slot_index,
-                 (unsigned)SAMPLE_RING_RECORD_MAX_LEN);
+                 (unsigned)required_len,
+                 (unsigned)target_capacity);
         return ESP_ERR_NO_MEM;
     }
 
-    memset(slot->payload, 0, SAMPLE_RING_RECORD_MAX_LEN);
+    if (target_capacity > slot->capacity) {
+        memset(next_payload + slot->capacity, 0,
+               target_capacity - slot->capacity);
+    }
+    slot->payload = next_payload;
+    slot->capacity = (uint32_t)target_capacity;
     return ESP_OK;
 }
 
@@ -2828,7 +2850,7 @@ static void sample_ring_push_payload(const char *payload, size_t len)
 
         alloc_slot = s_sample_ring_tail;
         sample_ring_record_t *slot = &s_sample_ring[alloc_slot];
-        if (!slot->payload) {
+        if (!slot->payload || slot->capacity < len) {
             need_alloc = true;
             portEXIT_CRITICAL(&s_sample_ring_lock);
         } else {
@@ -2843,7 +2865,7 @@ static void sample_ring_push_payload(const char *payload, size_t len)
         }
 
         if (need_alloc) {
-            if (sample_ring_ensure_slot_storage(alloc_slot) != ESP_OK) {
+            if (sample_ring_ensure_slot_storage(alloc_slot, len) != ESP_OK) {
                 ESP_LOGW(TAG,
                          "Failed to allocate sample ring slot storage (idx=%u, payload_len=%u)",
                          (unsigned)alloc_slot,
@@ -2884,6 +2906,12 @@ static void sample_ring_pop(void)
     head->len = 0;
     s_sample_ring_head = (uint8_t)((s_sample_ring_head + 1) % SAMPLE_RING_MAX_RECORDS);
     s_sample_ring_count--;
+    if (s_sample_ring_count == 0) {
+        /* Reuse the first slots after a completed flush instead of walking
+         * through and allocating every otherwise-empty ring position. */
+        s_sample_ring_head = 0;
+        s_sample_ring_tail = 0;
+    }
     portEXIT_CRITICAL(&s_sample_ring_lock);
 }
 

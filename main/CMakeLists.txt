@@ -62,12 +62,25 @@ set(edgez_sources
     "src/platform/esp32/ble_control.c"
     "src/platform/esp32/edgez_platform_adapter.c"
     "src/platform/esp32/halow_interface_app.cpp"
+    "src/platform/esp32/openmanet_alfred.c"
+    "src/platform/esp32/openmanet_comms.c"
     "src/platform/esp32/prov.c"
     "src/platform/esp32/status_led.c"
-    "src/platform/esp32/usb_control_transport.c"
     "src/protocol/edgez_frame_protocol.c"
     "src/protocol/edgez_lua_rpc.c"
-    "src/protocol/usb_control.pb.c")
+    "src/protocol/usb_control.pb.c"
+    "generated/google/protobuf/timestamp.pb.c"
+    "generated/openmanet/network/v1/datatype.pb.c"
+    "generated/openmanet/network/v1/mesh_neighbors.pb.c"
+    "generated/openmanet/network/v1/node.pb.c")
+
+if(CONFIG_EDGEZ_CUSTOM_USB_CONTROL)
+    list(APPEND edgez_sources
+        "src/platform/esp32/usb_control_transport.c")
+else()
+    list(APPEND edgez_sources
+        "src/platform/esp32/usb_control_transport_disabled.c")
+endif()
 
 if(CONFIG_EDGEZ_SENSOR_SCRIPTING)
     list(APPEND edgez_sources
@@ -85,7 +98,9 @@ endif()
 
 idf_component_register(
     SRCS ${edgez_sources}
-    INCLUDE_DIRS "include"
+    INCLUDE_DIRS
+        "include"
+        "generated"
     PRIV_INCLUDE_DIRS
         "include/edgez"
         "private_include"

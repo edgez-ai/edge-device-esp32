@@ -234,6 +234,16 @@ endmenu
 
 menu "HaLow Build Configuration"
 
+    config EDGEZ_CUSTOM_USB_CONTROL
+        bool "Enable custom USB control protocol on UART0"
+        default n
+        help
+            Enable the EdgeZ binary usb_control transport on the CP2102/UART0
+            connection. Disable this to leave UART0 as the normal ESP-IDF log
+            console: the custom parser, handshake, queues, tasks, UART driver
+            installation, and vprintf interception are omitted. BLE and the
+            shared NetworkPacket protobuf remain available.
+
     config ENABLE_MM_HALOW
         bool "Enable MM HaLow support"
         default y
@@ -283,6 +293,28 @@ menu "HaLow Mesh Experimental Configuration"
             Enable experimental mesh mode parameters for HaLow connect flow.
 
 if MM_EXPERIMENTAL_MESH
+
+    config MM_BATMAN_ADV_LITE
+        bool "Enable lightweight BATMAN-adv routing"
+        default y
+        help
+            Send and receive BATMAN_IV originator messages (EtherType 0x4305)
+            after the 802.11s controlled port opens. The lite routing plane
+            forwards transit OGMs, selects originator next hops using TQ,
+            tracks translation-table clients, and forwards BATMAN unicast and
+            broadcast packets. EdgeZ application payloads currently use those
+            routes with the existing EdgeZ framing; no bat0 interface is
+            created on the ESP32.
+
+    config MM_BATMAN_ADV_LITE_INTERVAL_MS
+        int "BATMAN-adv originator interval (ms)"
+        range 250 60000
+        default 3000
+        depends on MM_BATMAN_ADV_LITE
+        help
+            Period between local BATMAN_IV originator messages. HaLow meshes
+            benefit from a three-second default plus transmission jitter to
+            reduce control-plane airtime and synchronized collisions.
 
     config MM_EXPERIMENTAL_MESH_OP_CLASS
         int "Experimental mesh S1G operating class"
@@ -336,7 +368,8 @@ if MM_EXPERIMENTAL_MESH
         help
             Enable verbose mesh debug trace output from the application TX/RX
             paths and Morse Micro framework (mesh_trace, MESH_TRACE_FLOW,
-            mesh_key).
+            mesh_key, set_key, key_hw, mesh_tx_path, mesh_tx, mesh_rx,
+            scan_raw, and scan_debug).
             Disable to suppress all mesh debug prints for cleaner logs.
 
 endif

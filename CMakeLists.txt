@@ -69,10 +69,30 @@ idf_build_set_property(COMPILE_DEFINITIONS "CONFIG_MMHAL_CHIP_TYPE_MM6108=1" APP
 idf_build_set_property(COMPILE_DEFINITIONS "CONFIG_MMHAL_CHIP_TYPE_MM8108=0" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "CONFIG_MM_HALOW_MESH_JOIN_ONLY=1" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "MESH_PREQ_INTERVAL_MS=4000" APPEND)
-idf_build_set_property(COMPILE_DEFINITIONS "MMPKTMEM_TX_POOL_N_BLOCKS=20" APPEND)
-idf_build_set_property(COMPILE_DEFINITIONS "MMPKTMEM_RX_POOL_N_BLOCKS=23" APPEND)
+# The speed-test logs show simultaneous BLE ingress, local radio TX/RX and
+# BATMAN forwarding exhausting the original packet bounds. Double the bounds
+# so short bursts do not force avoidable flow-control pauses or RX drops.
+idf_build_set_property(COMPILE_DEFINITIONS "MMPKTMEM_TX_POOL_N_BLOCKS=40" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "MMPKTMEM_RX_POOL_N_BLOCKS=46" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "MMLOG_LEVEL_DEFAULT=1" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "NEED_AP_MLME" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "ON_DEMAND_TIMERS_ENABLED=0" APPEND)
 
 project(edge-device-esp32)
+
+# The Morse transport uses the ESP-IDF SPI polling API from its driver task.
+# ESP-IDF marks that hot path IRAM-safe, but when verbose logging is compiled
+# in it still enters the cross-core logging lock after every transaction. A
+# simultaneous hardware-AES CCMP operation can then hold the other core in the
+# scheduler long enough to trip the interrupt watchdog. Keep INFO/WARN/ERROR SPI
+# diagnostics while compiling the polling-path DEBUG/VERBOSE calls out.
+idf_component_get_property(edgez_spi_component esp_driver_spi COMPONENT_LIB)
+target_compile_definitions(${edgez_spi_component} PRIVATE LOG_LOCAL_LEVEL=3)
+
+# spi_bus_lock.c belongs to esp_hw_support rather than esp_driver_spi. Apply the
+# same ceiling only to that source so DEBUG/VERBOSE remains available elsewhere.
+idf_component_get_property(edgez_hw_support_component esp_hw_support COMPONENT_LIB)
+set_source_files_properties(
+    "$ENV{IDF_PATH}/components/esp_hw_support/spi_bus_lock.c"
+    TARGET_DIRECTORY ${edgez_hw_support_component}
+    PROPERTIES COMPILE_DEFINITIONS "LOG_LOCAL_LEVEL=3")

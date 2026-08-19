@@ -40,6 +40,7 @@
 #endif
 
 static const char *TAG = "halow_mesh_api";
+static const char *SPEED_TAG = "speed_test";
 
 #ifdef CONFIG_MM_MESH_DEBUG_LOG
 #define MESH_DEBUG_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
@@ -56,7 +57,7 @@ enum {
     EDGEZ_ROUTE_MAX_HOP_OFFSET = EDGEZ_ROUTE_TO_OFFSET + 8,
     EDGEZ_ROUTE_HOP_OFFSET = EDGEZ_ROUTE_MAX_HOP_OFFSET + 1,
     EDGEZ_ROUTE_PREFIX_LEN = EDGEZ_ROUTE_HOP_OFFSET + 1,
-    EDGEZ_ROUTE_TABLE_SIZE = 16,
+    EDGEZ_GLOBAL_BUFFER_TARGET_TABLE_SIZE = 16,
     EDGEZ_SEEN_MESSAGE_TABLE_SIZE = 32,
     EDGEZ_DELIVERY_DEDUPE_TABLE_SIZE = 32,
     EDGEZ_DELIVERY_DEDUPE_WINDOW_MS = 5000,
@@ -68,9 +69,23 @@ enum {
     EDGEZ_RELIABLE_ACK_TIMEOUT_MS = 240,
     EDGEZ_RELIABLE_MAX_ATTEMPTS = 3,
     DEVICE_RELIABLE_TASK_STACK_SIZE = 8192,
-    /* Realtime voice should buffer only a few frames; old audio is not useful. */
-    EDGEZ_VOICE_TX_QUEUE_DEPTH = 4,
-    EDGEZ_VOICE_TX_RETRY_DELAY_MS = 30,
+    /* Voice and speed-test traffic are best-effort. Keep enough frames to
+     * cover short scheduler stalls, but never build a stale realtime
+     * backlog when BATMAN or the radio is congested. */
+    EDGEZ_REALTIME_TX_QUEUE_DEPTH = 32,
+    EDGEZ_VOICE_TX_MAX_ATTEMPTS = 3,
+    EDGEZ_VOICE_TX_RETRY_DELAY_MS = 15,
+    /* A BLE write-without-response is dispatched on NimBLE's host task. It
+     * must never wait for radio capacity: blocking here prevents received ACL
+     * mbufs from being returned to the controller and eventually stalls the
+     * complete BLE link. The mobile producer provides bulk pacing; this queue
+     * only absorbs short scheduler and Morse DMA-return bursts. */
+    EDGEZ_SPEED_TX_MAX_ATTEMPTS = 8,
+    EDGEZ_SPEED_TX_RETRY_BASE_MS = 10,
+    EDGEZ_SPEED_TX_RETRY_MAX_MS = 50,
+    EDGEZ_REALTIME_PATH_CACHE_SIZE = 4,
+    EDGEZ_REALTIME_PATH_CACHE_TTL_MS = 250,
+    EDGEZ_TOPOLOGY_ROUTE_SNAPSHOT_MAX = 16,
     DEVICE_VOICE_TX_TASK_STACK_SIZE = 8192,
     EDGEZ_BEACON_TEXT_MAX_LEN = 480,
     EDGEZ_BEACON_AES_GCM_NONCE_SIZE = 12,
@@ -79,6 +94,8 @@ enum {
     EDGEZ_VOICE_RAW_MAGIC_SIZE = 4,
     EDGEZ_SPEED_RAW_MAGIC_SIZE = 4,
     EDGEZ_SPEED_FRAME_HEADER_SIZE = 26,
+    EDGEZ_SPEED_ROUTE_PIN_TABLE_SIZE = 24,
+    EDGEZ_SPEED_ROUTE_PIN_TTL_MS = 90U * 1000U,
     EDGEZ_GLOBAL_BUFFER_BLE_MAGIC_SIZE = 4,
     EDGEZ_VOICE_BLE_ROUTE_SIZE = 6 + 1 + 4,
     EDGEZ_VOICE_NONCE_SIZE = 12,
@@ -91,7 +108,10 @@ enum {
 };
 #define EDGEZ_APP_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define EDGEZ_SLEEP_TASK_STACK_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
-#define EDGEZ_MOBILE_DATA_QUEUE_BYTES (1024U * 1024U)
+/* A one-megabyte queue retained roughly 1,600 maximum-size frames, far more
+ * than a realtime mobile link can drain before they become stale. Keep a
+ * bounded burst cushion in PSRAM without permanently reserving 1 MiB. */
+#define EDGEZ_MOBILE_RX_QUEUE_BYTES (256U * 1024U)
 static const uint8_t EDGEZ_CONVERSATION_CHUNK_MAGIC[EDGEZ_CONVERSATION_CHUNK_MAGIC_SIZE] = {'E', 'V', '2'};
 static const uint8_t EDGEZ_BEACON_ENCRYPTED_MAGIC[EDGEZ_BEACON_ENCRYPTED_MAGIC_SIZE] = {'E', 'Z', 'B', 1};
 static const uint8_t EDGEZ_VOICE_RAW_MAGIC[EDGEZ_VOICE_RAW_MAGIC_SIZE] = {'V', 'C', 'R', 2};
@@ -111,6 +131,8 @@ static volatile uint8_t s_ble_profile_reports_remaining;
 static TaskHandle_t s_status_report_task;
 static TaskHandle_t s_device_beacon_task;
 static volatile bool s_device_beacon_force_once;
+static volatile uint32_t s_device_beacon_last_refresh_ms;
+static volatile uint32_t s_topology_report_last_broadcast_ms;
 static TaskHandle_t s_ble_shutdown_task;
 static TaskHandle_t s_reliable_tx_task;
 static TaskHandle_t s_voice_tx_task;
@@ -123,6 +145,10 @@ static uint8_t *s_voice_tx_queue_storage;
 static uint8_t *s_mobile_rx_queue_storage;
 static atomic_bool s_mobile_log_stream_enabled = ATOMIC_VAR_INIT(false);
 static atomic_bool s_mobile_log_delivery_active = ATOMIC_VAR_INIT(false);
+static atomic_uint_fast32_t s_realtime_tx_queue_drops = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t s_realtime_tx_send_failures = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t s_public_channel_mask =
+    ATOMIC_VAR_INIT(EDGEZ_PUBLIC_CHANNEL_ALL_MASK);
 static halow_sync_active_interface_t s_active_interface = HALOW_SYNC_ACTIVE_INTERFACE_NONE;
 static portMUX_TYPE s_device_settings_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_ble_shutdown_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -159,7 +185,8 @@ typedef struct {
     uint64_t chunk_group_id;
 } edgez_global_buffer_target_t;
 
-static edgez_global_buffer_target_t s_global_buffer_targets[EDGEZ_ROUTE_TABLE_SIZE];
+static edgez_global_buffer_target_t
+    s_global_buffer_targets[EDGEZ_GLOBAL_BUFFER_TARGET_TABLE_SIZE];
 static const uint8_t *s_global_buffer_data = NULL;
 static uint32_t s_global_buffer_length = 0;
 static uint8_t s_global_buffer_target_count;
@@ -230,18 +257,6 @@ enum {
 
 typedef struct {
     bool valid;
-    uint64_t target;
-    uint64_t next_hop;
-    uint8_t hop;
-    uint8_t max_hop;
-    uint32_t last_seen_ms;
-} edgez_route_entry_t;
-
-static edgez_route_entry_t s_route_table[EDGEZ_ROUTE_TABLE_SIZE];
-static portMUX_TYPE s_route_table_lock = portMUX_INITIALIZER_UNLOCKED;
-
-typedef struct {
-    bool valid;
     uint64_t high;
     uint64_t low;
     uint32_t sequence;
@@ -272,6 +287,7 @@ typedef struct {
     uint32_t max_hop;
     uint8_t attempts;
     uint32_t last_send_ms;
+    uint32_t ack_timeout_ms;
     size_t payload_len;
     uint8_t payload[ai_edgez_halow_NetworkPacket_size];
 } edgez_reliable_pending_t;
@@ -405,6 +421,12 @@ static void bridge_send_voice_frame(const uint8_t *payload, uint16_t payload_len
     }
 }
 
+void halow_sync_bridge_send_realtime_frame(const uint8_t *payload,
+                                            uint16_t payload_len)
+{
+    bridge_send_voice_frame(payload, payload_len);
+}
+
 bool halow_sync_bridge_queue_log_frame(const uint8_t *payload,
                                        uint16_t payload_len)
 {
@@ -451,6 +473,37 @@ static uint64_t mac_to_u64(const uint8_t mac[6])
            (uint64_t)mac[5];
 }
 
+bool halow_sync_public_channel_enabled(uint64_t id)
+{
+    if (!halow_sync_is_public_channel(id)) {
+        return false;
+    }
+    uint32_t index = (uint32_t)((id - EDGEZ_PUBLIC_CHANNEL_FIRST_ID) /
+                                EDGEZ_PUBLIC_CHANNEL_ID_STEP);
+    uint32_t mask = (uint32_t)atomic_load_explicit(
+        &s_public_channel_mask, memory_order_acquire);
+    return (mask & (1U << index)) != 0;
+}
+
+static void public_channel_mask_set(uint32_t mask)
+{
+    mask &= EDGEZ_PUBLIC_CHANNEL_ALL_MASK;
+    atomic_store_explicit(&s_public_channel_mask, mask, memory_order_release);
+    ESP_LOGI(TAG, "Public channel subscriptions updated mask=0x%02lx",
+             (unsigned long)mask);
+}
+
+static void u64_to_mac_bytes(uint64_t value, uint8_t mac[6])
+{
+    value &= 0xffffffffffffULL;
+    mac[0] = (uint8_t)(value >> 40);
+    mac[1] = (uint8_t)(value >> 32);
+    mac[2] = (uint8_t)(value >> 24);
+    mac[3] = (uint8_t)(value >> 16);
+    mac[4] = (uint8_t)(value >> 8);
+    mac[5] = (uint8_t)value;
+}
+
 static bool mac_is_broadcast_u64(uint64_t mac)
 {
     return (mac & 0xffffffffffffULL) == 0xffffffffffffULL;
@@ -467,11 +520,110 @@ static bool mac_is_zero_bytes(const uint8_t mac[6])
            mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
 }
 
-static bool route_table_lookup(uint64_t target, uint64_t *next_hop_out);
+static bool batman_route_lookup(uint64_t target, uint64_t *next_hop_out);
+static uint64_t read_u64_be(const uint8_t *in);
 
 static uint32_t route_now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+typedef enum {
+    SPEED_TRACE_MOBILE_IN = 0,
+    SPEED_TRACE_RELAY_IN,
+    SPEED_TRACE_RADIO_TX,
+    SPEED_TRACE_DEST_OUT,
+    SPEED_TRACE_STAGE_COUNT,
+} speed_trace_stage_t;
+
+typedef struct {
+    uint64_t transfer_id;
+    uint32_t started_ms;
+    uint32_t interval_started_ms;
+    uint32_t interval_frames;
+    uint64_t interval_bytes;
+    uint32_t total_frames;
+    uint64_t total_bytes;
+    uint32_t errors;
+} speed_trace_stats_t;
+
+static speed_trace_stats_t s_speed_trace[SPEED_TRACE_STAGE_COUNT];
+static portMUX_TYPE s_speed_trace_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void speed_trace_record(speed_trace_stage_t stage,
+                               const uint8_t *frame,
+                               size_t frame_len,
+                               uint32_t sequence,
+                               uint8_t hop,
+                               uint8_t max_hop,
+                               UBaseType_t queue_depth,
+                               esp_err_t result)
+{
+    if (stage >= SPEED_TRACE_STAGE_COUNT || !frame ||
+        frame_len < EDGEZ_SPEED_FRAME_HEADER_SIZE) {
+        return;
+    }
+
+    static const char *const stage_names[SPEED_TRACE_STAGE_COUNT] = {
+        "mobile_in", "relay_in", "radio_tx", "dest_out",
+    };
+    const uint64_t transfer_id = read_u64_be(frame + 6);
+    const uint8_t frame_type = frame[5];
+    const uint32_t now = route_now_ms();
+    bool emit = false;
+    speed_trace_stats_t snapshot = {0};
+    uint32_t interval_ms = 0;
+
+    portENTER_CRITICAL(&s_speed_trace_lock);
+    speed_trace_stats_t *stats = &s_speed_trace[stage];
+    if (stats->transfer_id != transfer_id) {
+        memset(stats, 0, sizeof(*stats));
+        stats->transfer_id = transfer_id;
+        stats->started_ms = now;
+        stats->interval_started_ms = now;
+    }
+    stats->interval_frames++;
+    stats->interval_bytes += frame_len;
+    stats->total_frames++;
+    stats->total_bytes += frame_len;
+    if (result != ESP_OK) stats->errors++;
+    interval_ms = now - stats->interval_started_ms;
+    emit = frame_type == 1 || frame_type == 3 || interval_ms >= 1000U;
+    if (emit) {
+        snapshot = *stats;
+        stats->interval_frames = 0;
+        stats->interval_bytes = 0;
+        stats->interval_started_ms = now;
+    }
+    portEXIT_CRITICAL(&s_speed_trace_lock);
+
+    if (!emit) return;
+    if (interval_ms == 0) interval_ms = 1;
+    uint32_t elapsed_ms = now - snapshot.started_ms;
+    if (elapsed_ms == 0) elapsed_ms = 1;
+    uint64_t interval_kbps =
+        snapshot.interval_bytes * 8ULL / interval_ms;
+    uint64_t average_kbps = snapshot.total_bytes * 8ULL / elapsed_ms;
+    esp_log_level_set(SPEED_TAG, ESP_LOG_INFO);
+    ESP_LOGI(
+        SPEED_TAG,
+        "SPEED_METRIC stage=%s transfer=%016llx type=%u seq=%lu hop=%u/%u interval_ms=%lu frames=%lu bytes=%llu kbps=%llu avg_kbps=%llu total_frames=%lu total_bytes=%llu queue=%u errors=%lu result=%s",
+        stage_names[stage],
+        (unsigned long long)transfer_id,
+        (unsigned)frame_type,
+        (unsigned long)sequence,
+        (unsigned)hop,
+        (unsigned)max_hop,
+        (unsigned long)interval_ms,
+        (unsigned long)snapshot.interval_frames,
+        (unsigned long long)snapshot.interval_bytes,
+        (unsigned long long)interval_kbps,
+        (unsigned long long)average_kbps,
+        (unsigned long)snapshot.total_frames,
+        (unsigned long long)snapshot.total_bytes,
+        (unsigned)queue_depth,
+        (unsigned long)snapshot.errors,
+        esp_err_to_name(result));
 }
 
 static int32_t topology_encode_rssi(int32_t rssi_dbm)
@@ -553,6 +705,7 @@ static void topology_note_peer_sensor_data(uint64_t peer_id,
         }
     }
     portEXIT_CRITICAL(&s_topology_lock);
+
 }
 
 static void topology_fill_peer_sensor_data(ai_edgez_halow_Peer *peer,
@@ -565,14 +718,6 @@ static void topology_fill_peer_sensor_data(ai_edgez_halow_Peer *peer,
     memcpy(peer->sensor_data,
            cached->sensor_data,
            cached->sensor_data_count * sizeof(cached->sensor_data[0]));
-}
-
-static void topology_peer_id_to_mac(uint64_t peer_id, uint8_t mac[6])
-{
-    for (int i = 5; i >= 0; --i) {
-        mac[i] = (uint8_t)(peer_id & 0xffU);
-        peer_id >>= 8;
-    }
 }
 
 static void topology_note_peer(uint64_t peer_id,
@@ -669,14 +814,16 @@ void halow_sync_bridge_fill_report_peers(ai_edgez_halow_Report *report)
     report->peers_count = 0;
     portENTER_CRITICAL(&s_topology_lock);
 
-    /* Connected peers are emitted first. The cache is keyed by peer MAC, so
-     * an entry that was also heard as a beacon is emitted only once here. */
+    /* Topology reports describe radio observations, not routing state.
+     * Connected peers are emitted first and recent beacons follow. BATMAN's
+     * route table is exposed separately through an on-demand local request. */
     for (int i = 0; i < EDGEZ_TOPOLOGY_MAX_PEERS; ++i) {
         edgez_topology_peer_t *cached = &s_topology_peers[i];
         if (cached->valid && cached->connected &&
             (now - cached->connected_last_seen_ms) <= EDGEZ_TOPOLOGY_CONNECTED_MS &&
             report->peers_count < EDGEZ_TOPOLOGY_MAX_PEERS) {
             ai_edgez_halow_Peer *peer = &report->peers[report->peers_count++];
+            *peer = (ai_edgez_halow_Peer)ai_edgez_halow_Peer_init_zero;
             peer->id = cached->peer_id;
             peer->rssi = cached->encoded_rssi != 0 ?
                          cached->encoded_rssi : EDGEZ_TOPOLOGY_RSSI_OFFSET;
@@ -700,6 +847,7 @@ void halow_sync_bridge_fill_report_peers(ai_edgez_halow_Report *report)
             continue;
         }
         ai_edgez_halow_Peer *peer = &report->peers[report->peers_count++];
+        *peer = (ai_edgez_halow_Peer)ai_edgez_halow_Peer_init_zero;
         peer->id = cached->peer_id;
         peer->rssi = cached->encoded_rssi != 0 ?
                      cached->encoded_rssi : EDGEZ_TOPOLOGY_RSSI_OFFSET;
@@ -1071,95 +1219,30 @@ static void device_mode_ble_shutdown_task(void *arg)
     }
 }
 
-static void route_table_update(uint64_t target,
-                               const uint8_t *next_hop_mac,
-                               uint8_t hop,
-                               uint8_t max_hop,
-                               const char *source)
-{
-    target &= 0xffffffffffffULL;
-    if (mac_is_zero_u64(target) || mac_is_broadcast_u64(target) ||
-        !next_hop_mac || mac_is_zero_bytes(next_hop_mac)) {
-        return;
-    }
-
-    uint64_t next_hop = mac_to_u64(next_hop_mac);
-    if (mac_is_zero_u64(next_hop) || mac_is_broadcast_u64(next_hop)) {
-        return;
-    }
-
-    topology_note_peer(target, INT32_MIN, false, true);
-    topology_note_peer(next_hop, INT32_MIN, false, true);
-
-    uint32_t now = route_now_ms();
-    int slot = -1;
-    int free_slot = -1;
-    int oldest_slot = 0;
-    uint32_t oldest_ms = UINT32_MAX;
-    portENTER_CRITICAL(&s_route_table_lock);
-    for (int i = 0; i < EDGEZ_ROUTE_TABLE_SIZE; ++i) {
-        if (s_route_table[i].valid && s_route_table[i].target == target) {
-            slot = i;
-            break;
-        }
-        if (!s_route_table[i].valid && free_slot < 0) {
-            free_slot = i;
-        }
-        if (s_route_table[i].last_seen_ms < oldest_ms) {
-            oldest_ms = s_route_table[i].last_seen_ms;
-            oldest_slot = i;
-        }
-    }
-    if (slot < 0) {
-        slot = (free_slot >= 0) ? free_slot : oldest_slot;
-    }
-    s_route_table[slot].valid = true;
-    s_route_table[slot].target = target;
-    s_route_table[slot].next_hop = next_hop;
-    s_route_table[slot].hop = hop;
-    s_route_table[slot].max_hop = max_hop;
-    s_route_table[slot].last_seen_ms = now;
-    portEXIT_CRITICAL(&s_route_table_lock);
-
-    MESH_DEBUG_LOGI(
-             "NetworkPacket route update target=0x%012llx next=%02x:%02x:%02x:%02x:%02x:%02x hop=%u max_hop=%u source=%s",
-             (unsigned long long)target,
-             next_hop_mac[0], next_hop_mac[1], next_hop_mac[2],
-             next_hop_mac[3], next_hop_mac[4], next_hop_mac[5],
-             (unsigned)hop,
-             (unsigned)max_hop,
-             source ? source : "unknown");
-}
-
-static bool route_table_lookup(uint64_t target, uint64_t *next_hop_out)
+static bool batman_route_lookup(uint64_t target, uint64_t *next_hop_out)
 {
     target &= 0xffffffffffffULL;
     if (mac_is_zero_u64(target) || mac_is_broadcast_u64(target) || !next_hop_out) {
         return false;
     }
-
-    bool found = false;
-    uint64_t next_hop = 0;
-    portENTER_CRITICAL(&s_route_table_lock);
-    for (int i = 0; i < EDGEZ_ROUTE_TABLE_SIZE; ++i) {
-        if (s_route_table[i].valid && s_route_table[i].target == target) {
-            next_hop = s_route_table[i].next_hop;
-            found = true;
-            break;
-        }
-    }
-    portEXIT_CRITICAL(&s_route_table_lock);
-
-    if (!found || mac_is_zero_u64(next_hop) || mac_is_broadcast_u64(next_hop)) {
+    const edgez_platform_api_t *platform = edgez_platform_get();
+    if (!platform || !platform->halow_lookup_route) {
         return false;
     }
-    *next_hop_out = next_hop;
+    uint8_t destination[6] = {0};
+    uint8_t next_hop[6] = {0};
+    u64_to_mac_bytes(target, destination);
+    if (!platform->halow_lookup_route(destination, next_hop, NULL, NULL, NULL) ||
+        mac_is_zero_bytes(next_hop)) {
+        return false;
+    }
+    *next_hop_out = mac_to_u64(next_hop);
     return true;
 }
 
-static bool route_table_lookup_hop(uint64_t target,
-                                   uint64_t *next_hop_out,
-                                   uint8_t *hop_out)
+static bool batman_route_lookup_hop(uint64_t target,
+                                    uint64_t *next_hop_out,
+                                    uint8_t *hop_out)
 {
     target &= 0xffffffffffffULL;
     if (mac_is_zero_u64(target) || mac_is_broadcast_u64(target) ||
@@ -1167,121 +1250,172 @@ static bool route_table_lookup_hop(uint64_t target,
         return false;
     }
 
+    const edgez_platform_api_t *platform = edgez_platform_get();
+    if (!platform || !platform->halow_lookup_route) {
+        return false;
+    }
+    uint8_t destination[6] = {0};
+    uint8_t next_hop[6] = {0};
+    uint8_t hop_count = 0;
+    u64_to_mac_bytes(target, destination);
+    if (!platform->halow_lookup_route(destination, next_hop, &hop_count,
+                                      NULL, NULL) ||
+        hop_count == 0 || mac_is_zero_bytes(next_hop)) {
+        return false;
+    }
+    *next_hop_out = mac_to_u64(next_hop);
+    /* Existing speed-policy code represents a direct destination as hop 0;
+     * BATMAN represents the same route as one link. Preserve that contract. */
+    if (hop_out) *hop_out = (uint8_t)(hop_count - 1U);
+    return true;
+}
+
+typedef struct {
+    bool valid;
+    uint64_t source;
+    uint64_t target;
+    uint64_t transfer_id;
+    uint64_t next_hop;
+    uint32_t last_used_ms;
+    uint8_t requested_hops;
+    uint8_t completed_hop;
+} edgez_speed_route_pin_t;
+
+static edgez_speed_route_pin_t
+    s_speed_route_pins[EDGEZ_SPEED_ROUTE_PIN_TABLE_SIZE];
+static portMUX_TYPE s_speed_route_pin_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool speed_route_pin_get(uint64_t source, uint64_t target,
+                                uint64_t transfer_id, uint8_t requested_hops,
+                                uint8_t completed_hop, uint64_t *next_hop_out)
+{
+    if (!next_hop_out) return false;
+    const uint32_t now = route_now_ms();
     bool found = false;
-    uint64_t next_hop = 0;
-    uint8_t hop = 0;
-    portENTER_CRITICAL(&s_route_table_lock);
-    for (int i = 0; i < EDGEZ_ROUTE_TABLE_SIZE; ++i) {
-        if (s_route_table[i].valid && s_route_table[i].target == target) {
-            next_hop = s_route_table[i].next_hop;
-            hop = s_route_table[i].hop;
+    portENTER_CRITICAL(&s_speed_route_pin_lock);
+    for (size_t i = 0; i < EDGEZ_SPEED_ROUTE_PIN_TABLE_SIZE; ++i) {
+        edgez_speed_route_pin_t *pin = &s_speed_route_pins[i];
+        if (pin->valid && (uint32_t)(now - pin->last_used_ms) >=
+                              EDGEZ_SPEED_ROUTE_PIN_TTL_MS) {
+            pin->valid = false;
+        }
+        if (pin->valid && pin->source == source && pin->target == target &&
+            pin->transfer_id == transfer_id &&
+            pin->requested_hops == requested_hops &&
+            pin->completed_hop == completed_hop) {
+            pin->last_used_ms = now;
+            *next_hop_out = pin->next_hop;
             found = true;
             break;
         }
     }
-    portEXIT_CRITICAL(&s_route_table_lock);
+    portEXIT_CRITICAL(&s_speed_route_pin_lock);
+    return found;
+}
 
-    if (!found || mac_is_zero_u64(next_hop) ||
-        mac_is_broadcast_u64(next_hop)) {
-        return false;
+static void speed_route_pin_put(uint64_t source, uint64_t target,
+                                uint64_t transfer_id, uint8_t requested_hops,
+                                uint8_t completed_hop, uint64_t next_hop)
+{
+    const uint32_t now = route_now_ms();
+    size_t slot = 0;
+    uint32_t oldest_age = 0;
+    portENTER_CRITICAL(&s_speed_route_pin_lock);
+    for (size_t i = 0; i < EDGEZ_SPEED_ROUTE_PIN_TABLE_SIZE; ++i) {
+        edgez_speed_route_pin_t *pin = &s_speed_route_pins[i];
+        if (!pin->valid ||
+            (pin->source == source && pin->target == target &&
+             pin->transfer_id == transfer_id &&
+             pin->requested_hops == requested_hops &&
+             pin->completed_hop == completed_hop)) {
+            slot = i;
+            oldest_age = UINT32_MAX;
+            break;
+        }
+        const uint32_t age = now - pin->last_used_ms;
+        if (age >= oldest_age) {
+            oldest_age = age;
+            slot = i;
+        }
     }
-    *next_hop_out = next_hop;
-    if (hop_out) *hop_out = hop;
-    return true;
+    s_speed_route_pins[slot] = (edgez_speed_route_pin_t) {
+        .valid = true,
+        .source = source,
+        .target = target,
+        .transfer_id = transfer_id,
+        .next_hop = next_hop,
+        .last_used_ms = now,
+        .requested_hops = requested_hops,
+        .completed_hop = completed_hop,
+    };
+    portEXIT_CRITICAL(&s_speed_route_pin_lock);
 }
 
 static bool speed_random_direct_peer(uint64_t exclude_a,
                                      uint64_t exclude_b,
+                                     uint64_t exclude_c,
                                      uint64_t route_key,
                                      uint64_t *peer_out)
 {
     if (!peer_out) return false;
-    uint64_t candidates[EDGEZ_ROUTE_TABLE_SIZE] = {0};
-    size_t count = 0;
     exclude_a &= 0xffffffffffffULL;
     exclude_b &= 0xffffffffffffULL;
-
-    portENTER_CRITICAL(&s_route_table_lock);
-    for (int i = 0; i < EDGEZ_ROUTE_TABLE_SIZE; ++i) {
-        const edgez_route_entry_t *entry = &s_route_table[i];
-        uint64_t peer = entry->target & 0xffffffffffffULL;
-        if (!entry->valid || entry->hop != 0 || entry->next_hop != peer ||
-            peer == exclude_a || peer == exclude_b ||
-            mac_is_zero_u64(peer) || mac_is_broadcast_u64(peer)) {
-            continue;
-        }
-        candidates[count++] = peer;
-    }
-    portEXIT_CRITICAL(&s_route_table_lock);
-    if (count == 0) return false;
-
-    uint64_t mixed_key = route_key ^ (route_key >> 33U) ^ (route_key << 11U);
-    *peer_out = candidates[mixed_key % count];
+    exclude_c &= 0xffffffffffffULL;
+    const edgez_platform_api_t *platform = edgez_platform_get();
+    if (!platform || !platform->halow_select_direct_peer) return false;
+    uint8_t exclude_a_mac[6] = {0};
+    uint8_t exclude_b_mac[6] = {0};
+    uint8_t exclude_c_mac[6] = {0};
+    uint8_t peer[6] = {0};
+    u64_to_mac_bytes(exclude_a, exclude_a_mac);
+    u64_to_mac_bytes(exclude_b, exclude_b_mac);
+    u64_to_mac_bytes(exclude_c, exclude_c_mac);
+    if (!platform->halow_select_direct_peer(exclude_a_mac, exclude_b_mac,
+                                             exclude_c_mac,
+                                             route_key, peer)) return false;
+    *peer_out = mac_to_u64(peer);
     return true;
 }
 
-static bool speed_source_next_hop(uint64_t target,
-                                  uint8_t requested_hops,
-                                  uint64_t source,
-                                  uint64_t transfer_id,
-                                  uint64_t *next_hop_out)
-{
-    if (!next_hop_out || requested_hops > 3) return false;
-    if (requested_hops == 0) {
-        *next_hop_out = target;
-        (void)route_table_lookup(target, next_hop_out);
-        return true;
-    }
-    if (requested_hops == 1) {
-        *next_hop_out = target;
-        return true;
-    }
-
-    uint64_t routed_next = 0;
-    uint8_t learned_hop = 0;
-    if (route_table_lookup_hop(target, &routed_next, &learned_hop) &&
-        (uint8_t)(learned_hop + 1U) == requested_hops) {
-        *next_hop_out = routed_next;
-        return true;
-    }
-    return speed_random_direct_peer(target, source, transfer_id, next_hop_out);
-}
-
-static bool speed_forward_next_hop(uint64_t target,
-                                   uint8_t requested_hops,
-                                   uint8_t completed_hop,
-                                   uint64_t ingress_peer,
+/* Mode 2 is the only explicit path-length override. If BATMAN already has a
+ * two-link route, address the first BATMAN hop as a waypoint. If the final
+ * destination is directly connected, choose a different direct peer and let
+ * that peer route the second leg. Modes 0, 1, and 3 remain automatic and are
+ * sent directly to BATMAN's final-destination lookup. */
+static bool speed_two_hop_waypoint(uint64_t target,
+                                   uint64_t source,
                                    uint64_t transfer_id,
-                                   uint64_t *next_hop_out)
+                                   uint64_t *waypoint_out)
 {
-    if (!next_hop_out || requested_hops == 0 || requested_hops > 3) {
+    if (!waypoint_out) return false;
+    if (speed_route_pin_get(source, target, transfer_id, 2, 0,
+                            waypoint_out)) {
+        return true;
+    }
+
+    uint64_t route_next = 0;
+    uint8_t route_hop = 0;
+    if (!batman_route_lookup_hop(target, &route_next, &route_hop)) {
         return false;
     }
-    uint8_t completed_count = (uint8_t)(completed_hop + 1U);
-    if (completed_count >= requested_hops) return false;
-    uint8_t remaining = (uint8_t)(requested_hops - completed_count);
-    if (remaining == 1) {
-        *next_hop_out = target;
-        return true;
+
+    bool selected = false;
+    if (route_hop == 1U) {
+        /* BATMAN reports two radio links using the legacy value one. */
+        *waypoint_out = route_next;
+        selected = true;
+    } else if (route_hop == 0U) {
+        /* The final destination is one link away. Force one different direct
+         * peer to become the application waypoint for this transfer. */
+        selected = speed_random_direct_peer(target, source, 0,
+                                             transfer_id, waypoint_out);
     }
 
-    uint64_t routed_next = 0;
-    uint8_t learned_hop = 0;
-    if (route_table_lookup_hop(target, &routed_next, &learned_hop) &&
-        (uint8_t)(learned_hop + 1U) == remaining &&
-        routed_next != ingress_peer) {
-        *next_hop_out = routed_next;
-        return true;
+    if (selected) {
+        speed_route_pin_put(source, target, transfer_id, 2, 0,
+                            *waypoint_out);
     }
-    if (speed_random_direct_peer(target, ingress_peer, transfer_id,
-                                 next_hop_out)) {
-        return true;
-    }
-    if (requested_hops == 3) {
-        *next_hop_out = target;
-        return true;
-    }
-    return false;
+    return selected;
 }
 
 static bool seen_message_drop_higher_hop(uint64_t high,
@@ -1406,7 +1540,8 @@ static bool reliable_packet_is_direct_unicast(const ai_edgez_halow_NetworkPacket
         return false;
     }
     uint64_t target = msg->to & 0xffffffffffffULL;
-    return !mac_is_zero_u64(target) && !mac_is_broadcast_u64(target);
+    return !mac_is_zero_u64(target) && !mac_is_broadcast_u64(target) &&
+           !halow_sync_is_public_channel(target);
 }
 
 static bool global_buffer_packet_is_request(const ai_edgez_halow_NetworkPacket *msg)
@@ -1481,6 +1616,15 @@ static void reliable_pending_store(const ai_edgez_halow_NetworkPacket *msg,
     int replace_slot = 0;
     uint32_t oldest_ms = UINT32_MAX;
     uint32_t now = route_now_ms();
+    uint64_t route_next_hop = next_hop;
+    uint8_t route_hop = 0;
+    bool routed = batman_route_lookup_hop(msg->to, &route_next_hop,
+                                           &route_hop);
+    /* batman_route_lookup_hop preserves the legacy convention where a direct
+     * route is hop 0. Add 180 ms for every additional radio hop so multi-hop
+     * ACKs do not trigger premature duplicate retransmissions. */
+    uint32_t ack_timeout_ms = 250U + (routed ? (uint32_t)route_hop * 180U : 0U);
+    if (ack_timeout_ms > 1200U) ack_timeout_ms = 1200U;
 
     portENTER_CRITICAL(&s_reliable_pending_lock);
     for (int i = 0; i < EDGEZ_RELIABLE_PENDING_TABLE_SIZE; ++i) {
@@ -1512,19 +1656,21 @@ static void reliable_pending_store(const ai_edgez_halow_NetworkPacket *msg,
     s_reliable_pending[slot].max_hop = default_network_packet_max_hop();
     s_reliable_pending[slot].attempts = 1;
     s_reliable_pending[slot].last_send_ms = now;
+    s_reliable_pending[slot].ack_timeout_ms = ack_timeout_ms;
     s_reliable_pending[slot].payload_len = payload_len;
     memcpy(s_reliable_pending[slot].payload, payload, payload_len);
     portEXIT_CRITICAL(&s_reliable_pending_lock);
 
     MESH_DEBUG_LOGI(
-             "NetworkPacket reliable track message_id=%016llx-%016llx seq=%lu from=0x%012llx to=0x%012llx next=0x%012llx len=%u",
+             "NetworkPacket reliable track message_id=%016llx-%016llx seq=%lu from=0x%012llx to=0x%012llx next=0x%012llx len=%u ack_timeout=%lu",
              (unsigned long long)msg->body.msg.message_id_high,
              (unsigned long long)msg->body.msg.message_id_low,
              (unsigned long)msg->body.msg.sequence,
              (unsigned long long)(msg->from & 0xffffffffffffULL),
              (unsigned long long)(msg->to & 0xffffffffffffULL),
              (unsigned long long)(next_hop & 0xffffffffffffULL),
-             (unsigned)payload_len);
+             (unsigned)payload_len,
+             (unsigned long)ack_timeout_ms);
 }
 
 static bool reliable_pending_ack(uint64_t message_id_high,
@@ -1633,7 +1779,7 @@ static esp_err_t send_reliable_ack(const ai_edgez_halow_NetworkPacket *msg,
     }
 
     uint64_t next_hop = msg->from;
-    (void)route_table_lookup(msg->from, &next_hop);
+    (void)batman_route_lookup(msg->from, &next_hop);
     esp_err_t err = edgez_platform_get()->halow_send_mesh_payload_via(encoded,
                                                               encoded_len,
                                                               ack.from,
@@ -1693,7 +1839,10 @@ static void reliable_tx_task(void *arg)
             if (!entry->valid) {
                 continue;
             }
-            if ((uint32_t)(now - entry->last_send_ms) < EDGEZ_RELIABLE_ACK_TIMEOUT_MS) {
+            uint32_t ack_timeout_ms = entry->ack_timeout_ms != 0
+                                          ? entry->ack_timeout_ms
+                                          : EDGEZ_RELIABLE_ACK_TIMEOUT_MS;
+            if ((uint32_t)(now - entry->last_send_ms) < ack_timeout_ms) {
                 continue;
             }
             if (entry->attempts >= EDGEZ_RELIABLE_MAX_ATTEMPTS) {
@@ -1756,6 +1905,14 @@ static void reliable_tx_task(void *arg)
             continue;
         }
 
+        /* The route may have changed while the ACK timer was running. Retry
+         * through BATMAN's current best next hop instead of repeatedly using
+         * the candidate selected for the first transmission. */
+        uint64_t refreshed_next_hop = to;
+        if (batman_route_lookup(to, &refreshed_next_hop)) {
+            next_hop = refreshed_next_hop;
+        }
+
         esp_err_t err = edgez_platform_get()->halow_send_mesh_payload_via(retry_payload,
                                                                   payload_len,
                                                                   from,
@@ -1773,6 +1930,108 @@ static void reliable_tx_task(void *arg)
                  (unsigned)attempts,
                  esp_err_to_name(err));
     }
+}
+
+typedef struct {
+    bool valid;
+    uint64_t target;
+    uint32_t sampled_ms;
+    UBaseType_t limit;
+    uint8_t tq;
+    uint8_t hops;
+    uint32_t route_age_ms;
+} edgez_realtime_path_cache_t;
+
+static edgez_realtime_path_cache_t
+    s_realtime_path_cache[EDGEZ_REALTIME_PATH_CACHE_SIZE];
+static uint8_t s_realtime_path_cache_replace_index;
+static portMUX_TYPE s_realtime_path_cache_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static UBaseType_t realtime_tx_path_limit(uint64_t target, uint8_t *tq_out,
+                                          uint8_t *hops_out,
+                                          uint32_t *route_age_ms_out)
+{
+    const uint32_t now_ms = route_now_ms();
+    uint8_t tq = 0;
+    uint8_t hops = 0;
+    uint32_t route_age_ms = UINT32_MAX;
+    UBaseType_t limit = 4;
+    const edgez_platform_api_t *platform = edgez_platform_get();
+    uint8_t destination[EDGEZ_ROUTE_MAC_LEN] = {0};
+    uint8_t next_hop[EDGEZ_ROUTE_MAC_LEN] = {0};
+
+    /* Route selection has already run for this packet. Cache the secondary
+     * lookup used only for queue sizing so a high-rate stream does not walk
+     * the BATMAN route table again for every frame. */
+    portENTER_CRITICAL(&s_realtime_path_cache_lock);
+    for (size_t i = 0; i < EDGEZ_REALTIME_PATH_CACHE_SIZE; ++i) {
+        edgez_realtime_path_cache_t *cached = &s_realtime_path_cache[i];
+        if (cached->valid && cached->target == target &&
+            (uint32_t)(now_ms - cached->sampled_ms) <
+                EDGEZ_REALTIME_PATH_CACHE_TTL_MS) {
+            limit = cached->limit;
+            tq = cached->tq;
+            hops = cached->hops;
+            route_age_ms = cached->route_age_ms;
+            portEXIT_CRITICAL(&s_realtime_path_cache_lock);
+            if (tq_out) *tq_out = tq;
+            if (hops_out) *hops_out = hops;
+            if (route_age_ms_out) *route_age_ms_out = route_age_ms;
+            return limit;
+        }
+    }
+    portEXIT_CRITICAL(&s_realtime_path_cache_lock);
+
+    for (size_t i = 0; i < EDGEZ_ROUTE_MAC_LEN; ++i) {
+        destination[EDGEZ_ROUTE_MAC_LEN - 1U - i] = (uint8_t)(target >> (i * 8U));
+    }
+    bool have_path = platform && platform->halow_lookup_route &&
+                     platform->halow_lookup_route(destination, next_hop,
+                                                  &hops, &tq,
+                                                  &route_age_ms);
+    if (have_path) {
+        if (tq >= 208U) {
+            limit = EDGEZ_REALTIME_TX_QUEUE_DEPTH;
+        } else if (tq >= 160U) {
+            limit = 12;
+        } else if (tq >= 112U) {
+            limit = 8;
+        } else {
+            limit = 4;
+        }
+        /* Each additional radio hop consumes airtime on another link. Do not
+         * allow a long source-side queue to amplify congestion downstream. */
+        if (hops >= 3U && limit > 4U) {
+            limit = 4U;
+        } else if (hops == 2U && limit > 8U) {
+            limit = 8U;
+        }
+        if (route_age_ms > 4000U && limit > 4U) {
+            limit = 4U;
+        }
+    }
+
+    portENTER_CRITICAL(&s_realtime_path_cache_lock);
+    edgez_realtime_path_cache_t *cached =
+        &s_realtime_path_cache[s_realtime_path_cache_replace_index];
+    *cached = (edgez_realtime_path_cache_t) {
+        .valid = true,
+        .target = target,
+        .sampled_ms = now_ms,
+        .limit = limit,
+        .tq = tq,
+        .hops = hops,
+        .route_age_ms = route_age_ms,
+    };
+    s_realtime_path_cache_replace_index =
+        (uint8_t)((s_realtime_path_cache_replace_index + 1U) %
+                  EDGEZ_REALTIME_PATH_CACHE_SIZE);
+    portEXIT_CRITICAL(&s_realtime_path_cache_lock);
+
+    if (tq_out) *tq_out = tq;
+    if (hops_out) *hops_out = hops;
+    if (route_age_ms_out) *route_age_ms_out = route_age_ms;
+    return limit;
 }
 
 static esp_err_t voice_tx_enqueue(const uint8_t *payload,
@@ -1805,34 +2064,67 @@ static esp_err_t voice_tx_enqueue(const uint8_t *payload,
     const bool is_speed = payload_len >= EDGEZ_SPEED_RAW_MAGIC_SIZE &&
                           memcmp(payload, EDGEZ_SPEED_RAW_MAGIC,
                                  EDGEZ_SPEED_RAW_MAGIC_SIZE) == 0;
-    TickType_t enqueue_wait = is_speed ? pdMS_TO_TICKS(5000) : 0;
-    if (xQueueSend(s_voice_tx_queue, &item, enqueue_wait) == pdPASS) {
-        return ESP_OK;
-    }
 
     if (is_speed) {
-        ESP_LOGW(TAG, "Speed TX queue remained full for 5 seconds seq=%lu",
-                 (unsigned long)msg->body.msg.sequence);
+        if (xQueueSend(s_voice_tx_queue, &item, 0) == pdPASS) {
+            return ESP_OK;
+        }
+
+        uint32_t drops = (uint32_t)atomic_fetch_add_explicit(
+                             &s_realtime_tx_queue_drops, 1,
+                             memory_order_relaxed) + 1U;
+        if (drops == 1U || (drops % 64U) == 0U) {
+            ESP_LOGW(TAG,
+                     "Speed TX queue full drops=%lu seq=%lu queue=%u nonblocking=1",
+                     (unsigned long)drops,
+                     (unsigned long)msg->body.msg.sequence,
+                     (unsigned)uxQueueMessagesWaiting(s_voice_tx_queue));
+        }
         return ESP_ERR_TIMEOUT;
     }
 
+    uint8_t path_tq = 0;
+    uint8_t path_hops = 0;
+    uint32_t route_age_ms = UINT32_MAX;
+    UBaseType_t path_limit = realtime_tx_path_limit(
+        msg->to, &path_tq, &path_hops, &route_age_ms);
+
+    bool dropped_oldest = false;
     edgez_voice_tx_item_t dropped;
-    if (xQueueReceive(s_voice_tx_queue, &dropped, 0) != pdPASS ||
-        xQueueSend(s_voice_tx_queue, &item, 0) != pdPASS) {
-        ESP_LOGW(TAG,
-                 "Voice TX queue full; enqueue failed message_id=%016llx-%016llx seq=%lu",
-                 (unsigned long long)msg->body.msg.message_id_high,
-                 (unsigned long long)msg->body.msg.message_id_low,
-                 (unsigned long)msg->body.msg.sequence);
-        return ESP_ERR_NO_MEM;
+    if (uxQueueMessagesWaiting(s_voice_tx_queue) >= path_limit &&
+        xQueueReceive(s_voice_tx_queue, &dropped, 0) == pdPASS) {
+        dropped_oldest = true;
+    }
+    bool enqueued = xQueueSend(s_voice_tx_queue, &item, 0) == pdPASS;
+    if (!enqueued && !dropped_oldest &&
+        xQueueReceive(s_voice_tx_queue, &dropped, 0) == pdPASS) {
+        dropped_oldest = true;
+        enqueued = xQueueSend(s_voice_tx_queue, &item, 0) == pdPASS;
+    }
+    if (!dropped_oldest) {
+        return enqueued ? ESP_OK : ESP_ERR_TIMEOUT;
     }
 
-    MESH_DEBUG_LOGI(
-        "Voice TX dropped stale message_id=%016llx-%016llx seq=%lu",
-        (unsigned long long)dropped.message_id_high,
-        (unsigned long long)dropped.message_id_low,
-        (unsigned long)dropped.sequence);
-    return ESP_OK;
+    /* Old voice and speed-test frames have less value than the newest frame.
+     * Count adaptive shedding as loss; sequence numbers let the receiver
+     * include it in its observed packet-loss measurement. */
+    uint32_t drops = (uint32_t)atomic_fetch_add_explicit(
+                         &s_realtime_tx_queue_drops, 1,
+                         memory_order_relaxed) + 1U;
+    if (drops == 1U || (drops % 64U) == 0U) {
+        ESP_LOGW(TAG,
+                 "Realtime BATMAN TX adaptive drop count=%lu newest=%s seq=%lu queue=%u soft_limit=%u tq=%u hops=%u route_age_ms=%lu accepted=%u",
+                 (unsigned long)drops,
+                 is_speed ? "speed" : "voice",
+                 (unsigned long)msg->body.msg.sequence,
+                 (unsigned)uxQueueMessagesWaiting(s_voice_tx_queue),
+                 (unsigned)path_limit,
+                 (unsigned)path_tq,
+                 (unsigned)path_hops,
+                 (unsigned long)route_age_ms,
+                 enqueued ? 1U : 0U);
+    }
+    return enqueued ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t halow_sync_bridge_handle_voice_to_radio(const uint8_t *payload,
@@ -1873,7 +2165,7 @@ esp_err_t halow_sync_bridge_handle_voice_to_radio(const uint8_t *payload,
     route.body.msg.sequence = sequence;
     generate_network_packet_message_id(&route.body.msg.message_id_high, &route.body.msg.message_id_low);
     uint64_t next_hop = to;
-    (void)route_table_lookup(to, &next_hop);
+    (void)batman_route_lookup(to, &next_hop);
     return voice_tx_enqueue(raw,
                             EDGEZ_VOICE_RAW_MAGIC_SIZE + crypto_len,
                             &route,
@@ -1920,19 +2212,46 @@ esp_err_t halow_sync_bridge_handle_speed_to_radio(const uint8_t *payload,
     route.body.msg.sequence = sequence;
     generate_network_packet_message_id(&route.body.msg.message_id_high,
                                        &route.body.msg.message_id_low);
-    uint64_t next_hop = 0;
-    if (!speed_source_next_hop(to, (uint8_t)max_hop, route.from,
-                               transfer_id, &next_hop)) {
+    uint64_t next_hop = to;
+    if (max_hop == 2U &&
+        !speed_two_hop_waypoint(to, route.from, transfer_id, &next_hop)) {
         ESP_LOGW(TAG,
-                 "Speed route unavailable transfer=%016llx seq=%lu target=0x%012llx requested_hops=%lu",
+                 "Speed two-hop waypoint unavailable transfer=%016llx seq=%lu target=0x%012llx",
                  (unsigned long long)transfer_id,
                  (unsigned long)sequence,
-                 (unsigned long long)(to & 0xffffffffffffULL),
-                 (unsigned long)max_hop);
+                 (unsigned long long)(to & 0xffffffffffffULL));
+        speed_trace_record(SPEED_TRACE_MOBILE_IN, speed_frame,
+                           speed_frame_len, sequence, 0, (uint8_t)max_hop,
+                           s_voice_tx_queue ?
+                               uxQueueMessagesWaiting(s_voice_tx_queue) : 0,
+                           ESP_ERR_NOT_FOUND);
         return ESP_ERR_NOT_FOUND;
     }
-    return voice_tx_enqueue(speed_frame, speed_frame_len, &route, max_hop,
-                            next_hop, false, 0);
+    MESH_DEBUG_LOGI(
+        "Speed TX policy transfer=%016llx target=0x%012llx mode=%lu rf_waypoint=0x%012llx forced_waypoint=%u",
+        (unsigned long long)transfer_id,
+        (unsigned long long)(to & 0xffffffffffffULL),
+        (unsigned long)max_hop,
+        (unsigned long long)(next_hop & 0xffffffffffffULL),
+        max_hop == 2U && next_hop != to ? 1U : 0U);
+    if (speed_frame[5] == 1U) {
+        ESP_LOGI(TAG,
+                 "Speed test route start transfer=%016llx mode=%lu final=0x%012llx rf_waypoint=0x%012llx forced=%u",
+                 (unsigned long long)transfer_id,
+                 (unsigned long)max_hop,
+                 (unsigned long long)(to & 0xffffffffffffULL),
+                 (unsigned long long)(next_hop & 0xffffffffffffULL),
+                 max_hop == 2U && next_hop != to ? 1U : 0U);
+    }
+    esp_err_t queue_err = voice_tx_enqueue(speed_frame, speed_frame_len,
+                                           &route, max_hop, next_hop,
+                                           false, 0);
+    speed_trace_record(SPEED_TRACE_MOBILE_IN, speed_frame, speed_frame_len,
+                       sequence, 0, (uint8_t)max_hop,
+                       s_voice_tx_queue ?
+                           uxQueueMessagesWaiting(s_voice_tx_queue) : 0,
+                       queue_err);
+    return queue_err;
 }
 
 static void voice_tx_task(void *arg)
@@ -1945,29 +2264,54 @@ static void voice_tx_task(void *arg)
             continue;
         }
 
-        esp_err_t err = item.forward_from_mobile
-            ? edgez_platform_get()->halow_forward_mesh_payload(item.payload,
-                                                        item.payload_len,
-                                                        item.from,
-                                                        item.to,
-                                                        item.next_hop,
-                                                        item.message_id_high,
-                                                        item.message_id_low,
-                                                        item.max_hop,
-                                                        item.sequence,
-                                                        item.mobile_initial_hop)
-            : edgez_platform_get()->halow_send_mesh_payload_via(item.payload,
-                                                        item.payload_len,
-                                                        item.from,
-                                                        item.to,
-                                                        item.next_hop,
-                                                        item.message_id_high,
-                                                        item.message_id_low,
-                                                        item.max_hop,
-                                                        item.sequence);
         const bool is_speed = item.payload_len >= EDGEZ_SPEED_FRAME_HEADER_SIZE &&
                               memcmp(item.payload, EDGEZ_SPEED_RAW_MAGIC,
                                      EDGEZ_SPEED_RAW_MAGIC_SIZE) == 0;
+        const uint8_t max_attempts = is_speed
+                                         ? EDGEZ_SPEED_TX_MAX_ATTEMPTS
+                                         : EDGEZ_VOICE_TX_MAX_ATTEMPTS;
+        esp_err_t err = ESP_FAIL;
+        uint8_t attempts = 0;
+        do {
+            attempts++;
+            err = item.forward_from_mobile
+                ? edgez_platform_get()->halow_forward_mesh_payload(
+                      item.payload, item.payload_len, item.from, item.to,
+                      item.next_hop, item.message_id_high, item.message_id_low,
+                      item.max_hop, item.sequence, item.mobile_initial_hop)
+                : edgez_platform_get()->halow_send_mesh_payload_via(
+                      item.payload, item.payload_len, item.from, item.to,
+                      item.next_hop, item.message_id_high, item.message_id_low,
+                      item.max_hop, item.sequence);
+            bool retryable = err == ESP_ERR_TIMEOUT;
+#if !defined(CONFIG_BUILD_EDGEZ_FROM_SOURCE) || !CONFIG_BUILD_EDGEZ_FROM_SOURCE
+            /* The legacy prebuilt adapter predates EDGEZ_RADIO_RETRY and can
+             * only report generic ESP_FAIL for temporary TX pressure. */
+            retryable = retryable || err == ESP_FAIL;
+#endif
+            if (err == ESP_OK || !retryable || attempts >= max_attempts) {
+                break;
+            }
+
+            /* Keep the item at the head of the logical stream while Morse
+             * returns completed DMA packets. Bulk traffic backs off more as
+             * pressure persists; live voice keeps its short fixed delay. */
+            uint32_t retry_delay_ms = EDGEZ_VOICE_TX_RETRY_DELAY_MS;
+            if (is_speed) {
+                retry_delay_ms = EDGEZ_SPEED_TX_RETRY_BASE_MS * attempts;
+                if (retry_delay_ms > EDGEZ_SPEED_TX_RETRY_MAX_MS) {
+                    retry_delay_ms = EDGEZ_SPEED_TX_RETRY_MAX_MS;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+        } while (true);
+        if (is_speed) {
+            speed_trace_record(
+                SPEED_TRACE_RADIO_TX, item.payload, item.payload_len,
+                item.sequence, (uint8_t)(item.mobile_initial_hop + 1U),
+                (uint8_t)item.max_hop,
+                uxQueueMessagesWaiting(s_voice_tx_queue), err);
+        }
         if (is_speed && (item.payload[5] == 1 || item.payload[5] == 3)) {
             ESP_LOGD(TAG,
                      "Stream TX speed type=%u transfer=%016llx seq=%lu bytes=%u queue=%u err=%s",
@@ -1986,25 +2330,21 @@ static void voice_tx_task(void *arg)
                  (unsigned)uxQueueMessagesWaiting(s_voice_tx_queue),
                  esp_err_to_name(err));
         if (err != ESP_OK) {
-            if (is_speed) {
-                ESP_LOGW(TAG,
-                         "Speed TX failed seq=%lu bytes=%u err=%s; preserving queue=%u",
-                         (unsigned long)item.sequence,
-                         (unsigned)item.payload_len,
-                         esp_err_to_name(err),
-                         (unsigned)uxQueueMessagesWaiting(s_voice_tx_queue));
-                vTaskDelay(pdMS_TO_TICKS(EDGEZ_VOICE_TX_RETRY_DELAY_MS));
-                continue;
+            uint32_t failures = (uint32_t)atomic_fetch_add_explicit(
+                                    &s_realtime_tx_send_failures, 1,
+                                    memory_order_relaxed) + 1U;
+            if (failures == 1U || (failures % 64U) == 0U) {
+                ESP_LOGW(
+                    TAG,
+                    "Realtime BATMAN TX dropped after %u attempts failures=%lu kind=%s seq=%lu bytes=%u err=%s queue=%u",
+                    (unsigned)attempts,
+                    (unsigned long)failures,
+                    is_speed ? "speed" : "voice",
+                    (unsigned long)item.sequence,
+                    (unsigned)item.payload_len,
+                    esp_err_to_name(err),
+                    (unsigned)uxQueueMessagesWaiting(s_voice_tx_queue));
             }
-            /* A failed route cannot consume queued realtime audio. Discard the
-             * stale backlog and let the next captured frame retry the route. */
-            unsigned dropped_count = 0;
-            edgez_voice_tx_item_t dropped;
-            while (xQueueReceive(s_voice_tx_queue, &dropped, 0) == pdPASS) {
-                dropped_count++;
-            }
-            MESH_DEBUG_LOGI("Voice TX route unavailable; dropped=%u", dropped_count);
-            vTaskDelay(pdMS_TO_TICKS(EDGEZ_VOICE_TX_RETRY_DELAY_MS));
         }
     }
 }
@@ -2318,7 +2658,7 @@ static esp_err_t global_buffer_send_status(uint64_t requester,
     }
 
     uint64_t next_hop = response.to;
-    (void)route_table_lookup(response.to, &next_hop);
+    (void)batman_route_lookup(response.to, &next_hop);
     return edgez_platform_get()->halow_send_mesh_payload_via(
         encoded,
         encoded_len,
@@ -2419,7 +2759,7 @@ static esp_err_t global_buffer_tx_start_for_requester(uint64_t requester,
         chunk_sequence = (uint32_t)requested_chunk_index;
     }
     uint64_t next_hop = requester;
-    (void)route_table_lookup(requester, &next_hop);
+    (void)batman_route_lookup(requester, &next_hop);
 
     portENTER_CRITICAL(&s_global_buffer_tx_lock);
     memset(s_global_buffer_targets, 0, sizeof(s_global_buffer_targets));
@@ -2678,6 +3018,9 @@ void halow_sync_bridge_fill_status(ai_edgez_halow_HaLowInterfaceStatus *status)
     status->ready_for_report = snapshot.ready_for_report;
     status->ethertype = HALOW_SYNC_ETHERTYPE;
     status->license_status = halow_license_status();
+    status->has_public_channel_mask = true;
+    status->public_channel_mask = (uint32_t)atomic_load_explicit(
+        &s_public_channel_mask, memory_order_acquire);
     strlcpy(status->firmware_version,
             esp_app_get_description()->version,
             sizeof(status->firmware_version));
@@ -2708,6 +3051,52 @@ static void fill_response_base(ai_edgez_halow_NetworkPacket *response,
         response->to = request->from;
         response->from = request->to;
     }
+}
+
+static esp_err_t send_routing_table_response(
+    const ai_edgez_halow_NetworkPacket *request)
+{
+    if (!request || request->operation != ai_edgez_halow_Operation_REQUEST) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ai_edgez_halow_NetworkPacket response =
+        ai_edgez_halow_NetworkPacket_init_zero;
+    fill_response_base(&response, request);
+    const edgez_platform_api_t *platform = edgez_platform_get();
+    uint8_t self_mac[EDGEZ_ROUTE_MAC_LEN] = {0};
+    if (platform && platform->halow_get_self_mac &&
+        platform->halow_get_self_mac(self_mac)) {
+        response.from = mac_to_u64(self_mac);
+    }
+    response.which_body =
+        ai_edgez_halow_NetworkPacket_routing_table_tag;
+
+    edgez_platform_halow_route_t routes[
+        EDGEZ_TOPOLOGY_ROUTE_SNAPSHOT_MAX] = {0};
+    size_t count = platform && platform->halow_get_routes
+                       ? platform->halow_get_routes(
+                             routes, EDGEZ_TOPOLOGY_ROUTE_SNAPSHOT_MAX)
+                       : 0;
+    if (count > EDGEZ_TOPOLOGY_ROUTE_SNAPSHOT_MAX) {
+        count = EDGEZ_TOPOLOGY_ROUTE_SNAPSHOT_MAX;
+    }
+    response.body.routing_table.routes_count = (pb_size_t)count;
+    for (size_t i = 0; i < count; ++i) {
+        ai_edgez_halow_RouteEntry *entry =
+            &response.body.routing_table.routes[i];
+        entry->destination = mac_to_u64(routes[i].originator);
+        entry->next_hop = mac_to_u64(routes[i].next_hop);
+        entry->tq = routes[i].tq;
+        entry->hops = routes[i].hops;
+        entry->age_ms = routes[i].age_ms;
+    }
+    if (!send_network_packet(&response)) {
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "BATMAN routing table response routes=%u",
+             (unsigned)count);
+    return ESP_OK;
 }
 
 static uint32_t normalize_device_beacon_interval(uint32_t seconds)
@@ -3454,8 +3843,16 @@ static void status_report_task(void *arg)
     (void)arg;
 
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_MM_HALOW_STATUS_REPORT_INTERVAL_MS));
+        (void)ulTaskNotifyTake(pdTRUE,
+                               pdMS_TO_TICKS(CONFIG_MM_HALOW_STATUS_REPORT_INTERVAL_MS));
         send_periodic_status_frame();
+    }
+}
+
+void halow_sync_bridge_request_status_report(void)
+{
+    if (s_status_report_task != NULL) {
+        xTaskNotifyGive(s_status_report_task);
     }
 }
 
@@ -3476,6 +3873,7 @@ void halow_sync_bridge_note_ble_connected(bool connected)
         if (s_device_beacon_task != NULL) {
             xTaskNotifyGive(s_device_beacon_task);
         }
+        halow_sync_bridge_request_status_report();
         return;
     }
     if (s_active_interface == HALOW_SYNC_ACTIVE_INTERFACE_BLE) {
@@ -3746,6 +4144,9 @@ static void device_beacon_task(void *arg)
                 }
                 esp_err_t err = edgez_platform_get()->network_refresh_halow_mesh_vendor_ie(settings.mesh_id,
                                                                        settings.passphrase);
+                if (err == ESP_OK) {
+                    s_device_beacon_last_refresh_ms = route_now_ms();
+                }
                 bool beacon_error = sensor_err != ESP_OK || err != ESP_OK;
                 edgez_platform_get()->led_set_error(EDGEZ_PLATFORM_LED_ERROR_BEACON, beacon_error);
                 if (!beacon_error) {
@@ -3799,6 +4200,10 @@ static esp_err_t handle_halow_init_config(const ai_edgez_halow_NetworkPacket *ms
     if (!factory_data_sdk_release_is_authorized()) {
         ESP_LOGW(TAG, "HaLow init rejected: SDK release is not authorized");
         return ESP_ERR_NOT_ALLOWED;
+    }
+
+    if (config->has_public_channel_mask) {
+        public_channel_mask_set(config->public_channel_mask);
     }
 
     /* An INIT carrying only the signed SDK release is the authorization
@@ -3992,7 +4397,16 @@ static esp_err_t handle_location_update(const ai_edgez_halow_NetworkPacket *msg,
         true,
         updated.latitude,
         updated.longitude);
-    if (s_device_beacon_task != NULL) {
+    const uint32_t now_ms = route_now_ms();
+    /* This accessor reads the retained DeviceSettings snapshot populated from
+     * DEVICE_SETTINGS_NVS_INTERVAL during startup (and updated after SET). */
+    const uint32_t configured_interval_ms =
+        halow_sync_bridge_beacon_interval_seconds() * 1000U;
+    const uint32_t last_refresh_ms = s_device_beacon_last_refresh_ms;
+    const bool immediate_beacon = s_device_beacon_task != NULL &&
+        (last_refresh_ms == 0 ||
+         (uint32_t)(now_ms - last_refresh_ms) >= configured_interval_ms);
+    if (immediate_beacon) {
         s_device_beacon_force_once = true;
         xTaskNotifyGive(s_device_beacon_task);
     }
@@ -4001,12 +4415,95 @@ static esp_err_t handle_location_update(const ai_edgez_halow_NetworkPacket *msg,
              (double)updated.latitude,
              (double)updated.longitude,
              (unsigned long long)location->timestamp_ms,
-             s_device_beacon_task != NULL ? 1U : 0U);
+             immediate_beacon ? 1U : 0U);
     send_status_frame((uint16_t)request_id, msg);
     if (sent_status_response) {
         *sent_status_response = true;
     }
     return ESP_OK;
+}
+
+static void notify_beacon_to_mobile(const ai_edgez_halow_Beacon *beacon,
+                                    const uint8_t peer_mac[6])
+{
+    ai_edgez_halow_NetworkPacket msg = ai_edgez_halow_NetworkPacket_init_zero;
+    fill_response_base(&msg, NULL);
+    if (peer_mac != NULL && !mac_is_zero_bytes(peer_mac)) {
+        msg.from = mac_to_u64(peer_mac);
+    }
+    msg.operation = ai_edgez_halow_Operation_BROADCAST;
+    msg.which_body = ai_edgez_halow_NetworkPacket_beacon_tag;
+    msg.body.beacon = *beacon;
+    send_network_packet(&msg);
+}
+
+static void notify_topology_report(const uint8_t peer_mac[6], uint16_t seq)
+{
+    ai_edgez_halow_NetworkPacket msg = ai_edgez_halow_NetworkPacket_init_zero;
+    fill_response_base(&msg, NULL);
+    uint8_t self_mac[EDGEZ_ROUTE_MAC_LEN] = {0};
+    if (!edgez_platform_get()->halow_get_self_mac(self_mac)) {
+        ESP_LOGW(TAG, "NetworkPacket report skipped; local HaLow MAC unavailable");
+        return;
+    }
+    msg.from = mac_to_u64(self_mac);
+    msg.to = 0;
+    msg.operation = ai_edgez_halow_Operation_BROADCAST;
+    msg.which_body = ai_edgez_halow_NetworkPacket_report_tag;
+    halow_sync_bridge_fill_report_peers(&msg.body.report);
+    if (msg.body.report.peers_count == 0) {
+        return;
+    }
+
+    const uint32_t now_ms = route_now_ms();
+    const uint32_t last_broadcast_ms = s_topology_report_last_broadcast_ms;
+    const uint32_t topology_interval_ms =
+        halow_sync_bridge_beacon_interval_seconds() * 1000U;
+    if (last_broadcast_ms != 0 &&
+        (uint32_t)(now_ms - last_broadcast_ms) <
+            topology_interval_ms) {
+        return;
+    }
+    s_topology_report_last_broadcast_ms = now_ms;
+
+    /* Deliver locally and publish through BATMAN broadcast at most once per
+     * topology interval. BATMAN owns multi-hop fanout and duplicate
+     * suppression; the peer cache still updates for every received beacon. */
+    send_network_packet(&msg);
+
+    uint8_t encoded[ai_edgez_halow_NetworkPacket_size] = {0};
+    pb_ostream_t stream = pb_ostream_from_buffer(encoded, sizeof(encoded));
+    if (!pb_encode(&stream, ai_edgez_halow_NetworkPacket_fields, &msg)) {
+        ESP_LOGW(TAG,
+                 "NetworkPacket report broadcast encode failed: %s",
+                 PB_GET_ERROR(&stream));
+        return;
+    }
+
+    esp_err_t report_err = edgez_platform_get()->halow_send_peer_independent_beacon(
+        encoded,
+        stream.bytes_written,
+        msg.from,
+        0,
+        0,
+        0,
+        default_network_packet_max_hop(),
+        seq);
+    if (report_err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "NetworkPacket report broadcast seq=%u observer=0x%012llx heard=0x%012llx peers=%u len=%u",
+                 (unsigned)seq,
+                 (unsigned long long)(msg.from & 0xffffffffffffULL),
+                 (unsigned long long)(peer_mac != NULL ? mac_to_u64(peer_mac) : 0),
+                 (unsigned)msg.body.report.peers_count,
+                 (unsigned)stream.bytes_written);
+    } else {
+        ESP_LOGW(TAG,
+                 "NetworkPacket report broadcast failed observer=0x%012llx peers=%u err=%s",
+                 (unsigned long long)(msg.from & 0xffffffffffffULL),
+                 (unsigned)msg.body.report.peers_count,
+                 esp_err_to_name(report_err));
+    }
 }
 
 void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
@@ -4061,69 +4558,38 @@ void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
     }
 
     uint16_t seq = ++s_from_radio_seq;
-    ai_edgez_halow_NetworkPacket beacon_msg = ai_edgez_halow_NetworkPacket_init_zero;
-    fill_response_base(&beacon_msg, NULL);
-    if (peer_mac != NULL && !mac_is_zero_bytes(peer_mac)) {
-        beacon_msg.from = mac_to_u64(peer_mac);
-    }
-    beacon_msg.operation = ai_edgez_halow_Operation_BROADCAST;
-    beacon_msg.which_body = ai_edgez_halow_NetworkPacket_beacon_tag;
-    beacon_msg.body.beacon = *beacon;
-    send_network_packet(&beacon_msg);
+    notify_beacon_to_mobile(beacon, peer_mac);
+    notify_topology_report(peer_mac, seq);
+}
 
-    ai_edgez_halow_NetworkPacket report_msg = ai_edgez_halow_NetworkPacket_init_zero;
-    fill_response_base(&report_msg, NULL);
-    uint8_t self_mac[EDGEZ_ROUTE_MAC_LEN] = {0};
-    if (!edgez_platform_get()->halow_get_self_mac(self_mac)) {
-        ESP_LOGW(TAG, "NetworkPacket report skipped; local HaLow MAC unavailable");
+void halow_sync_bridge_notify_batman_peer(const uint8_t originator[6],
+                                          const uint8_t last_sender[6],
+                                          int32_t rssi_dbm,
+                                          uint32_t sequence,
+                                          bool direct)
+{
+    if (!originator || mac_is_zero_bytes(originator)) {
         return;
     }
-    report_msg.from = mac_to_u64(self_mac);
-    report_msg.to = 0;
-    report_msg.operation = ai_edgez_halow_Operation_BROADCAST;
-    report_msg.which_body = ai_edgez_halow_NetworkPacket_report_tag;
-    halow_sync_bridge_fill_report_peers(&report_msg.body.report);
-    if (report_msg.body.report.peers_count > 0) {
-        /* Deliver the topology snapshot to the attached mobile and broadcast
-         * the same compact report over HaLow. The full heard Beacon is sent
-         * only to the local mobile as NetworkPacket.beacon. RX reports are not
-         * retransmitted by the bridge, preventing report bounce loops. */
-        send_network_packet(&report_msg);
 
-        uint8_t encoded[ai_edgez_halow_NetworkPacket_size] = {0};
-        pb_ostream_t report_stream = pb_ostream_from_buffer(encoded, sizeof(encoded));
-        if (!pb_encode(&report_stream, ai_edgez_halow_NetworkPacket_fields, &report_msg)) {
-            ESP_LOGW(TAG,
-                     "NetworkPacket report broadcast encode failed: %s",
-                     PB_GET_ERROR(&report_stream));
-            return;
-        }
+    uint64_t peer_id = mac_to_u64(originator);
+    /* Only direct BATMAN neighbors are physical topology links. Multi-hop
+     * originators remain available through the on-demand routing table. */
+    topology_note_peer(peer_id, direct ? rssi_dbm : INT32_MIN, false, direct);
 
-        esp_err_t report_err = edgez_platform_get()->halow_send_peer_independent_beacon(
-            encoded,
-            report_stream.bytes_written,
-            report_msg.from,
-            0,
-            0,
-            0,
-            default_network_packet_max_hop(),
-            seq);
-        if (report_err == ESP_OK) {
-            ESP_LOGI(TAG,
-                     "NetworkPacket report broadcast seq=%u observer=0x%012llx heard=0x%012llx peers=%u len=%u",
-                     (unsigned)seq,
-                     (unsigned long long)(report_msg.from & 0xffffffffffffULL),
-                     (unsigned long long)(peer_mac != NULL ? mac_to_u64(peer_mac) : 0),
-                     (unsigned)report_msg.body.report.peers_count,
-                     (unsigned)report_stream.bytes_written);
-        } else {
-            ESP_LOGW(TAG,
-                     "NetworkPacket report broadcast failed observer=0x%012llx peers=%u err=%s",
-                     (unsigned long long)(report_msg.from & 0xffffffffffffULL),
-                     (unsigned)report_msg.body.report.peers_count,
-                     esp_err_to_name(report_err));
-        }
-    }
+    /* BATMAN-IV OGMs are routing control-plane traffic. Keep their peer data
+     * in the local topology table, but do not synthesize NetworkPacket.beacon
+     * messages for the mobile client. Mobile discovery must contain only
+     * real EdgeZ application beacons. */
+
+    ESP_LOGI(TAG,
+             "BATMAN peer topology updated orig=%02x:%02x:%02x:%02x:%02x:%02x via=%02x:%02x:%02x:%02x:%02x:%02x rssi=%ld seq=%lu direct=%u",
+             originator[0], originator[1], originator[2],
+             originator[3], originator[4], originator[5],
+             last_sender ? last_sender[0] : 0, last_sender ? last_sender[1] : 0,
+             last_sender ? last_sender[2] : 0, last_sender ? last_sender[3] : 0,
+             last_sender ? last_sender[4] : 0, last_sender ? last_sender[5] : 0,
+             (long)rssi_dbm, (unsigned long)sequence, direct ? 1U : 0U);
 }
 
 esp_err_t halow_sync_bridge_handle_to_radio(const uint8_t *payload,
@@ -4213,7 +4679,7 @@ esp_err_t halow_sync_bridge_handle_to_radio(const uint8_t *payload,
     if (msg.operation == ai_edgez_halow_Operation_ACKNOWLEDGE &&
         msg.which_body == ai_edgez_halow_NetworkPacket_msg_tag) {
         uint64_t next_hop = msg.to;
-        bool routed = route_table_lookup(msg.to, &next_hop);
+        bool routed = batman_route_lookup(msg.to, &next_hop);
         MESH_DEBUG_LOGI(
                  "NetworkPacket TX message ACK route target=0x%012llx next=0x%012llx routed=%u message_id=%016llx-%016llx seq=%lu",
                  (unsigned long long)(msg.to & 0xffffffffffffULL),
@@ -4247,8 +4713,24 @@ esp_err_t halow_sync_bridge_handle_to_radio(const uint8_t *payload,
     switch (msg.which_body) {
     case ai_edgez_halow_NetworkPacket_msg_tag:
         {
+            const bool public_channel = halow_sync_is_public_channel(msg.to);
+            if (public_channel &&
+                msg.body.msg.mime != ai_edgez_halow_Mime_MIME_TEXT &&
+                msg.body.msg.mime != ai_edgez_halow_Mime_MIME_VOICE) {
+                ESP_LOGW(TAG,
+                         "Public channel TX rejected channel=%llu mime=%u; use conversation text/voice or the OMC PTT transport",
+                         (unsigned long long)msg.to,
+                         (unsigned)msg.body.msg.mime);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (public_channel && !halow_sync_public_channel_enabled(msg.to)) {
+                ESP_LOGW(TAG,
+                         "Public channel TX rejected for disabled channel=%llu",
+                         (unsigned long long)msg.to);
+                return ESP_ERR_INVALID_STATE;
+            }
             uint64_t next_hop = msg.to;
-            bool routed = route_table_lookup(msg.to, &next_hop);
+            bool routed = batman_route_lookup(msg.to, &next_hop);
             MESH_DEBUG_LOGI(
                      "NetworkPacket TX route target=0x%012llx next=0x%012llx routed=%u message_id=%016llx-%016llx",
                      (unsigned long long)(msg.to & 0xffffffffffffULL),
@@ -4347,6 +4829,12 @@ esp_err_t halow_sync_bridge_handle_to_radio(const uint8_t *payload,
         return err;
     case ai_edgez_halow_NetworkPacket_location_update_tag:
         return handle_location_update(&msg, request_id, sent_status_response);
+    case ai_edgez_halow_NetworkPacket_routing_table_tag:
+        err = send_routing_table_response(&msg);
+        if (sent_status_response) {
+            *sent_status_response = true;
+        }
+        return err;
     default:
         return ESP_ERR_INVALID_ARG;
     }
@@ -4356,7 +4844,8 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
                                        unsigned header_len,
                                        uint8_t *payload,
                                        unsigned payload_len,
-                                       const uint8_t *remote_bssid)
+                                       const uint8_t *remote_bssid,
+                                       bool batman_delivered)
 {
     if (!factory_data_license_authorize(EDGEZ_LICENSE_CAP_MESH_RX)) {
         return false;
@@ -4389,7 +4878,6 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
     unsigned network_payload_len = payload_len;
     bool deliver_original_network_payload = false;
     const uint8_t *learn_next_hop = (remote_bssid && !mac_is_zero_bytes(remote_bssid)) ? remote_bssid : &header[6];
-    const char *learn_source = (learn_next_hop == remote_bssid) ? "ta" : "sa";
 
     if (payload_len > EDGEZ_ROUTE_PREFIX_LEN) {
         uint64_t candidate_message_id_high = read_u64_be(payload);
@@ -4420,11 +4908,8 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
             uint64_t target_mac = prefix_to & 0xffffffffffffULL;
             bool target_is_local = mac_is_zero_u64(target_mac) ||
                                    mac_is_broadcast_u64(target_mac) ||
+                                   halow_sync_is_public_channel(target_mac) ||
                                    (have_self_mac && target_mac == self_mac_u64);
-
-            if (prefix_from != 0 && prefix_from != self_mac_u64) {
-                route_table_update(prefix_from, learn_next_hop, prefix_hop, prefix_max_hop, learn_source);
-            }
 
             MESH_DEBUG_LOGI(
                      "NetworkPacket RX route prefix message_id=%016llx-%016llx seq=%lu from=0x%012llx to=0x%012llx max_hop=%u hop=%u local=%u da=%02x:%02x:%02x:%02x:%02x:%02x sa=%02x:%02x:%02x:%02x:%02x:%02x ta=%02x:%02x:%02x:%02x:%02x:%02x",
@@ -4442,46 +4927,29 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
                      remote_bssid ? remote_bssid[2] : 0, remote_bssid ? remote_bssid[3] : 0,
                      remote_bssid ? remote_bssid[4] : 0, remote_bssid ? remote_bssid[5] : 0);
 
-            if (!target_is_local) {
+            const bool is_speed =
+                network_payload_len >= EDGEZ_SPEED_FRAME_HEADER_SIZE &&
+                memcmp(network_payload, EDGEZ_SPEED_RAW_MAGIC,
+                       EDGEZ_SPEED_RAW_MAGIC_SIZE) == 0;
+            if (!target_is_local && batman_delivered) {
+                /* BATMAN only releases a unicast after its destination
+                 * originator has been reached. The application address may
+                 * name a translated client identity, so do not start a
+                 * second, competing forwarding pass here. */
+                MESH_DEBUG_LOGI(
+                    "NetworkPacket RX accept BATMAN terminal delivery logical_target=0x%012llx local=0x%012llx",
+                    (unsigned long long)target_mac,
+                    (unsigned long long)self_mac_u64);
+            }
+            if (!target_is_local && !batman_delivered) {
                 uint64_t next_hop = prefix_to;
-                bool routed = route_table_lookup(prefix_to, &next_hop);
+                bool routed = batman_route_lookup(prefix_to, &next_hop);
                 uint64_t ingress_peer = mac_to_u64(learn_next_hop);
-                bool is_speed = network_payload_len >= EDGEZ_SPEED_FRAME_HEADER_SIZE &&
-                                memcmp(network_payload, EDGEZ_SPEED_RAW_MAGIC,
-                                       EDGEZ_SPEED_RAW_MAGIC_SIZE) == 0;
                 if (is_speed &&
                     (network_payload[4] != 3 || prefix_max_hop > 3 ||
                      read_u64_be(network_payload + 6) == 0)) {
                     MESH_DEBUG_LOGI("Speed RX drop invalid v3 frame/TTL");
                     return true;
-                }
-                const uint8_t requested_hops = is_speed ? prefix_max_hop : 0;
-                if (is_speed && requested_hops == 0) {
-                    uint32_t automatic_ttl = default_network_packet_max_hop();
-                    uint32_t completed_hops = (uint32_t)prefix_hop + 1U;
-                    if (automatic_ttl == 0 || completed_hops >= automatic_ttl) {
-                        MESH_DEBUG_LOGI(
-                            "Speed RX drop automatic TTL target=0x%012llx completed=%lu ttl=%lu",
-                            (unsigned long long)target_mac,
-                            (unsigned long)completed_hops,
-                            (unsigned long)automatic_ttl);
-                        return true;
-                    }
-                }
-                if (is_speed && requested_hops > 0) {
-                    if (!speed_forward_next_hop(prefix_to, requested_hops,
-                                                prefix_hop, ingress_peer,
-                                                read_u64_be(network_payload + 6),
-                                                &next_hop)) {
-                        MESH_DEBUG_LOGI(
-                            "Speed RX drop hop rule target=0x%012llx requested=%u completed=%u ingress=0x%012llx",
-                            (unsigned long long)target_mac,
-                            (unsigned)requested_hops,
-                            (unsigned)(prefix_hop + 1U),
-                            (unsigned long long)ingress_peer);
-                        return true;
-                    }
-                    routed = next_hop != prefix_to;
                 }
                 bool invalid_pseudo_target = target_mac <= 0x00000000ffffffffULL;
                 bool reverses_to_ingress = target_mac == ingress_peer ||
@@ -4512,6 +4980,45 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
                              (unsigned)prefix_max_hop,
                              (unsigned)prefix_hop,
                              (unsigned)best_hop);
+                    return true;
+                }
+                if (is_speed) {
+                    ai_edgez_halow_NetworkPacket forward_route =
+                        ai_edgez_halow_NetworkPacket_init_zero;
+                    forward_route.which_body =
+                        ai_edgez_halow_NetworkPacket_msg_tag;
+                    forward_route.from = prefix_from;
+                    forward_route.to = prefix_to;
+                    forward_route.body.msg.message_id_high =
+                        prefix_message_id_high;
+                    forward_route.body.msg.message_id_low =
+                        prefix_message_id_low;
+                    forward_route.body.msg.sequence = prefix_sequence;
+                    esp_err_t queue_err = voice_tx_enqueue(
+                        network_payload,
+                        network_payload_len,
+                        &forward_route,
+                        prefix_max_hop,
+                        next_hop,
+                        true,
+                        (uint32_t)prefix_hop + 1U);
+                    speed_trace_record(
+                        SPEED_TRACE_RELAY_IN, network_payload,
+                        network_payload_len, prefix_sequence,
+                        (uint8_t)(prefix_hop + 1U), prefix_max_hop,
+                        s_voice_tx_queue ?
+                            uxQueueMessagesWaiting(s_voice_tx_queue) : 0,
+                        queue_err);
+                    if (queue_err != ESP_OK) {
+                        ESP_LOGW(
+                            TAG,
+                            "Speed relay queue failed transfer=%016llx seq=%lu hop=%u/%u err=%s",
+                            (unsigned long long)read_u64_be(network_payload + 6),
+                            (unsigned long)prefix_sequence,
+                            (unsigned)(prefix_hop + 1U),
+                            (unsigned)prefix_max_hop,
+                            esp_err_to_name(queue_err));
+                    }
                     return true;
                 }
                 esp_err_t fwd_err = edgez_platform_get()->halow_forward_mesh_payload(network_payload,
@@ -4557,6 +5064,13 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
             if (network_payload_len >= EDGEZ_SPEED_FRAME_HEADER_SIZE &&
                 memcmp(network_payload, EDGEZ_SPEED_RAW_MAGIC,
                        EDGEZ_SPEED_RAW_MAGIC_SIZE) == 0) {
+                speed_trace_record(
+                    SPEED_TRACE_DEST_OUT, network_payload,
+                    network_payload_len, prefix_sequence,
+                    (uint8_t)(prefix_hop + 1U), prefix_max_hop,
+                    s_mobile_rx_queue ?
+                        uxQueueMessagesWaiting(s_mobile_rx_queue) : 0,
+                    ESP_OK);
                 uint8_t notify[EDGEZ_ROUTE_MAC_LEN + ai_edgez_halow_NetworkPacket_size];
                 if (network_payload_len > sizeof(notify) - EDGEZ_ROUTE_MAC_LEN) {
                     return true;
@@ -4644,17 +5158,21 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
         uint64_t self_mac_u64 = have_self_mac ? mac_to_u64(self_mac) : 0;
         uint8_t max_hop = prefix_max_hop ? prefix_max_hop : (uint8_t)default_network_packet_max_hop();
         uint8_t hop = have_route_prefix ? prefix_hop : 0;
-        if (!have_route_prefix && msg.from != 0 && msg.from != self_mac_u64) {
-            route_table_update(msg.from, learn_next_hop, hop, max_hop, learn_source);
-        }
         if (!have_route_prefix && msg.which_body == ai_edgez_halow_NetworkPacket_msg_tag) {
             uint64_t target_mac = msg.to & 0xffffffffffffULL;
             bool target_is_local = mac_is_zero_u64(target_mac) ||
                                    mac_is_broadcast_u64(target_mac) ||
+                                   halow_sync_is_public_channel(target_mac) ||
                                    (have_self_mac && target_mac == self_mac_u64);
-            if (!target_is_local) {
+            if (!target_is_local && batman_delivered) {
+                MESH_DEBUG_LOGI(
+                    "NetworkPacket RX accept BATMAN terminal delivery without prefix logical_target=0x%012llx local=0x%012llx",
+                    (unsigned long long)target_mac,
+                    (unsigned long long)self_mac_u64);
+            }
+            if (!target_is_local && !batman_delivered) {
                 uint64_t next_hop = msg.to;
-                bool routed = route_table_lookup(msg.to, &next_hop);
+                bool routed = batman_route_lookup(msg.to, &next_hop);
                 uint8_t best_hop = hop;
                 bool drop_higher_hop = seen_message_drop_higher_hop(msg.body.msg.message_id_high,
                                                                     msg.body.msg.message_id_low,
@@ -4818,6 +5336,13 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
                                      (notify_has_message ? msg.body.msg.message_id_low : 0);
     uint64_t notify_from = have_route_prefix ? prefix_from : msg.from;
     uint64_t notify_to = have_route_prefix ? prefix_to : msg.to;
+    if (halow_sync_is_public_channel(notify_to) &&
+        !halow_sync_public_channel_enabled(notify_to)) {
+        MESH_DEBUG_LOGI(
+            "NetworkPacket RX mobile notify suppressed for disabled public channel=%llu",
+            (unsigned long long)notify_to);
+        return true;
+    }
     bool notify_is_ack = have_network_packet && msg.operation == ai_edgez_halow_Operation_ACKNOWLEDGE;
     bool notify_is_report = have_network_packet &&
                             msg.which_body == ai_edgez_halow_NetworkPacket_report_tag;
@@ -4921,16 +5446,16 @@ static bool mobile_data_queues_init(void)
 {
     if (s_voice_tx_queue && s_mobile_rx_queue) return true;
 
-    const UBaseType_t tx_depth =
-        (UBaseType_t)(EDGEZ_MOBILE_DATA_QUEUE_BYTES / sizeof(edgez_voice_tx_item_t));
+    const UBaseType_t tx_depth = EDGEZ_REALTIME_TX_QUEUE_DEPTH;
     const UBaseType_t rx_depth =
-        (UBaseType_t)(EDGEZ_MOBILE_DATA_QUEUE_BYTES / sizeof(edgez_mobile_rx_item_t));
+        (UBaseType_t)(EDGEZ_MOBILE_RX_QUEUE_BYTES / sizeof(edgez_mobile_rx_item_t));
     if (tx_depth == 0 || rx_depth == 0) return false;
 
+    const size_t tx_queue_bytes = tx_depth * sizeof(edgez_voice_tx_item_t);
     s_voice_tx_queue_storage = (uint8_t *)heap_caps_malloc(
-        EDGEZ_MOBILE_DATA_QUEUE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        tx_queue_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_mobile_rx_queue_storage = (uint8_t *)heap_caps_malloc(
-        EDGEZ_MOBILE_DATA_QUEUE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        EDGEZ_MOBILE_RX_QUEUE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_voice_tx_queue_storage || !s_mobile_rx_queue_storage) {
         heap_caps_free(s_voice_tx_queue_storage);
         heap_caps_free(s_mobile_rx_queue_storage);
@@ -4958,10 +5483,10 @@ static bool mobile_data_queues_init(void)
     }
 
     ESP_LOGI(TAG,
-             "Mobile data queues ready in PSRAM TX=%u bytes/%u frames RX=%u bytes/%u frames",
-             (unsigned)EDGEZ_MOBILE_DATA_QUEUE_BYTES,
+             "Mobile data queues ready in PSRAM realtime_TX=%u bytes/%u frames best_effort=1 RX=%u bytes/%u frames",
+             (unsigned)tx_queue_bytes,
              (unsigned)tx_depth,
-             (unsigned)EDGEZ_MOBILE_DATA_QUEUE_BYTES,
+             (unsigned)EDGEZ_MOBILE_RX_QUEUE_BYTES,
              (unsigned)rx_depth);
     return true;
 }
@@ -4973,9 +5498,6 @@ void halow_sync_bridge_init(void)
     atomic_store_explicit(&s_mobile_log_delivery_active, false,
                           memory_order_release);
     s_from_radio_seq = 0;
-    portENTER_CRITICAL(&s_route_table_lock);
-    memset(s_route_table, 0, sizeof(s_route_table));
-    portEXIT_CRITICAL(&s_route_table_lock);
     portENTER_CRITICAL(&s_seen_message_lock);
     memset(s_seen_messages, 0, sizeof(s_seen_messages));
     s_seen_message_replace_index = 0;
@@ -4989,8 +5511,12 @@ void halow_sync_bridge_init(void)
     portENTER_CRITICAL(&s_reliable_pending_lock);
     memset(s_reliable_pending, 0, sizeof(s_reliable_pending));
     portEXIT_CRITICAL(&s_reliable_pending_lock);
+    portENTER_CRITICAL(&s_realtime_path_cache_lock);
+    memset(s_realtime_path_cache, 0, sizeof(s_realtime_path_cache));
+    s_realtime_path_cache_replace_index = 0;
+    portEXIT_CRITICAL(&s_realtime_path_cache_lock);
     if (!mobile_data_queues_init()) {
-        ESP_LOGE(TAG, "Failed to create 1 MiB PSRAM mobile TX/RX queues");
+        ESP_LOGE(TAG, "Failed to create PSRAM mobile TX/RX queues");
     }
     if (factory_data_license_authorize(EDGEZ_LICENSE_CAP_RADIO_INIT)) {
         esp_err_t halow_err = edgez_platform_get()->halow_init();
@@ -5063,7 +5589,7 @@ void halow_sync_bridge_init(void)
                                                  "halow_voice_tx",
                                                  DEVICE_VOICE_TX_TASK_STACK_SIZE,
                                                  NULL,
-                                                 4,
+                                                 5,
                                                  &s_voice_tx_task,
                                                  EDGEZ_APP_TASK_STACK_CAPS);
         if (created != pdPASS) {
