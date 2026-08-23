@@ -107,6 +107,7 @@ extern "C" esp_err_t halow_build_edgez_mesh_vendor_ie(
     size_t *out_len);
 extern "C" esp_err_t halow_notify_mesh_beacon_to_mobile(
     const struct mmwlan_scan_result *result,
+    uint8_t channel_number,
     const char *expected_mesh_id,
     const char *passphrase);
 extern "C" bool halow_edgez_mesh_peer_admission_allowed(
@@ -141,10 +142,13 @@ static void halow_event_task(void *arg)
             result.rssi = event.data.beacon.rssi_dbm;
             esp_err_t err = halow_notify_mesh_beacon_to_mobile(
                 &result,
+                event.data.beacon.channel_number,
                 event.data.beacon.mesh_id,
                 event.data.beacon.passphrase);
-            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
-                ESP_LOGW(TAG, "Queued HaLow beacon handling failed: %s",
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "MAC RX beacon event not delivered channel=%u: %s",
+                         (unsigned)event.data.beacon.channel_number,
                          esp_err_to_name(err));
             }
             break;

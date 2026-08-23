@@ -48,6 +48,12 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# Keep the BLE controller and NimBLE host away from the high-rate Morse GPIO
+# and SPI interrupt service installed by app_main on core 0. Under sustained
+# HaLow mesh traffic, sharing core 0 can starve BLE connection events until the
+# central's supervision timeout expires.
+CONFIG_BT_CTRL_PINNED_TO_CORE_1=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
 CONFIG_NIMBLE_ATT_PREFERRED_MTU=517

@@ -12,11 +12,7 @@ extern "C" {
 
 #define OPENMANET_COMMS_MAGIC_LEN 4U
 
-/* Phone payload:
- * - OMC1, talkgroup port (BE16), raw 48 kHz/20 ms Opus frame.
- * - OMC2, final peer MAC (48-bit), raw 48 kHz/20 ms Opus frame.
- * OMC1 is carried as BATMAN broadcast; OMC2 is BATMAN unicast and the radio
- * MAC only sees the selected direct next hop. */
+/* Phone payload: OMC1, talkgroup port (BE16), raw 48 kHz/20 ms Opus frame. */
 esp_err_t openmanet_comms_send_phone_frame(const uint8_t *payload,
                                             size_t payload_len);
 

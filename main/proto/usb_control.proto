@@ -200,6 +200,7 @@ message Beacon {
   float longitude = 6;
   MarkerColor marker = 7;
   DeviceType device_type = 8;
+  uint32 channel_number = 9;  // country-specific S1G receive channel
   bool sleeping = 10;
   GeoFence geo_fence = 100;
   repeated SensorData sensor_data = 101;  // only for beacon and sensor type
@@ -273,6 +274,8 @@ message DeviceSettings {
   uint64 beacon_unicast = 22;
   DeviceType device_type = 24;
   bool sleep_mode_enabled = 25;
+  uint32 mesh_frequency_khz = 26;
+  uint32 mesh_bandwidth_mhz = 27;
   bool device_gps_enabled = 28;
 }
 

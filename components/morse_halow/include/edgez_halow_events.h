@@ -37,6 +37,7 @@ typedef struct {
         struct {
             uint16_t ies_len;
             int32_t rssi_dbm;
+            uint8_t channel_number;
             uint8_t bssid[6];
             char mesh_id[33];
             char passphrase[65];

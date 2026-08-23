@@ -1587,6 +1587,8 @@ static bool halow_parse_edgez_discovery_ie(const uint8_t *ies,
         return true;
     }
 
+    ESP_LOGW(TAG, "No valid compact EdgeZ discovery IE found in MAC RX IEs len=%u",
+             (unsigned)ies_len);
     return false;
 }
 
@@ -1635,6 +1637,7 @@ bool halow_edgez_mesh_peer_admission_allowed(const uint8_t *ies,
 }
 
 esp_err_t halow_notify_mesh_beacon_to_mobile(const struct mmwlan_scan_result *result,
+                                             uint8_t channel_number,
                                              const char *expected_mesh_id,
                                              const char *passphrase)
 {
@@ -1664,17 +1667,22 @@ esp_err_t halow_notify_mesh_beacon_to_mobile(const struct mmwlan_scan_result *re
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    /* The receiver's MAC RX frequency is the sole source of truth. The radio
+     * layer maps that frequency to this channel before queueing the event. */
+    beacon.channel_number = channel_number;
+
     /* Live Vendor IE callbacks provide the beacon IE list but not transmitter
      * metadata. Keep the shared scan/live decoder safe and report an unknown
      * peer address instead of dereferencing a NULL synthetic-result BSSID. */
     const uint8_t *peer_bssid = result->bssid != NULL ? result->bssid : unknown_bssid;
     const uint8_t *peer_mac = peer_bssid;
     ESP_LOGI(TAG,
-             "Mesh beacon notify BLE peer=%02x:%02x:%02x:%02x:%02x:%02x user=%016llx-%016llx hop=%u/%u",
+             "Mesh beacon notify BLE peer=%02x:%02x:%02x:%02x:%02x:%02x user=%016llx-%016llx channel=%lu hop=%u/%u",
              peer_bssid[0], peer_bssid[1], peer_bssid[2],
              peer_bssid[3], peer_bssid[4], peer_bssid[5],
              (unsigned long long)beacon.user_id_high,
              (unsigned long long)beacon.user_id_low,
+             (unsigned long)beacon.channel_number,
              0U,
              0U);
     /* This callback carries the RSSI for the actual peer beacon. The global

@@ -573,9 +573,7 @@ static void usb_process_payload(const uint8_t *payload, uint16_t payload_len)
         const uint8_t *realtime = payload + USB_PROTOCOL_HEADER_LEN;
         size_t realtime_len = payload_len - USB_PROTOCOL_HEADER_LEN;
         esp_err_t err = realtime_len > OPENMANET_COMMS_MAGIC_LEN &&
-                        memcmp(realtime, "OMC", OPENMANET_COMMS_MAGIC_LEN - 1U) == 0 &&
-                        (realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 1U ||
-                         realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 2U)
+                        memcmp(realtime, "OMC\1", OPENMANET_COMMS_MAGIC_LEN) == 0
             ? openmanet_comms_send_phone_frame(realtime, realtime_len)
             : halow_sync_bridge_handle_voice_to_radio(realtime, realtime_len);
         if (err == ESP_OK) {

@@ -10,6 +10,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
@@ -41,6 +42,15 @@ static const char *TAG = "ble_control";
 #endif
 
 #define BLE_LOG_PROTOCOL_MAX_PAYLOAD 256
+#define BLE_CONTROL_RX_QUEUE_DEPTH 8
+/* This worker runs the same protobuf -> BATMAN routing path as the USB
+ * mobile-to-HaLow worker. That path exceeds 8 KiB when a conversation packet
+ * is encrypted and wrapped for radio TX, so keep the stacks aligned. */
+#define BLE_CONTROL_RX_TASK_STACK_SIZE 16384
+#define BLE_CONTROL_RX_TASK_PRIORITY 5
+#define BLE_SECURITY_RESTORE_GRACE_MS 750
+#define BLE_SECURITY_TASK_STACK_SIZE 3072
+#define BLE_SECURITY_TASK_PRIORITY 5
 
 #ifdef CONFIG_MM_MESH_DEBUG_LOG
 #define MESH_DEBUG_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
@@ -78,6 +88,7 @@ static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool s_ble_data_len_requested;
 static bool s_ble_phy_requested;
 static uint16_t s_ble_control_tx_val_handle;
+static uint32_t s_ble_control_keepalive_counter;
 static uint16_t s_ble_voice_tx_val_handle;
 static uint16_t s_ble_ota_status_val_handle;
 static uint8_t s_ble_control_rx[EDGEZ_FRAME_MAX_LEN * 2];
@@ -124,6 +135,18 @@ typedef struct {
     uint16_t tx_val_handle;
 } ble_control_endpoint_t;
 
+typedef struct {
+    ble_control_channel_t channel;
+    uint16_t frame_len;
+    uint32_t connection_generation;
+    uint8_t frame[EDGEZ_FRAME_MAX_LEN];
+} ble_control_rx_frame_t;
+
+static QueueHandle_t s_ble_control_rx_queue;
+static TaskHandle_t s_ble_control_rx_task;
+static TaskHandle_t s_ble_security_task;
+static volatile uint32_t s_ble_connection_generation;
+
 static const ble_control_endpoint_t s_ble_endpoints[] = {
     {
         .channel = BLE_CONTROL_CHANNEL_CONTROL,
@@ -168,31 +191,121 @@ static void log_hex_limited(const char *label, const uint8_t *data, size_t len)
 }
 
 static esp_err_t ble_control_start_advertising(void);
-static void ble_control_request_fast_connection(uint16_t conn_handle);
 static void ble_control_request_data_length(uint16_t conn_handle);
-static void ble_control_request_2m_phy(uint16_t conn_handle);
+static void ble_control_leave_phy_to_central(uint16_t conn_handle);
 static int ble_control_gatt_access(uint16_t conn_handle,
                                    uint16_t attr_handle,
                                    struct ble_gatt_access_ctxt *ctxt,
                                    void *arg);
+static void ble_only_send_frame(void *ctx,
+                                const uint8_t *payload,
+                                uint16_t payload_len);
 
-static void ble_control_request_fast_connection(uint16_t conn_handle)
+static void ble_control_reset_rx_work(void)
 {
-    const struct ble_gap_upd_params params = {
-        .itvl_min = 6, /* 7.5 ms, in 1.25 ms units. */
-        .itvl_max = 6, /* Keep bulk realtime transfers at the fastest interval. */
-        .latency = 0,
-        .supervision_timeout = 600, /* 6 seconds, in 10 ms units. */
-        .min_ce_len = 0,
-        .max_ce_len = 0,
-    };
-    int rc = ble_gap_update_params(conn_handle, &params);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
-        ESP_LOGW(TAG, "BLE fast connection parameter request failed: %d", rc);
-    } else {
-        MESH_DEBUG_LOGI("BLE fast connection parameters requested (7.5 ms)");
+    ++s_ble_connection_generation;
+    if (s_ble_control_rx_queue) {
+        (void)xQueueReset(s_ble_control_rx_queue);
+    }
+}
+
+static void ble_control_rx_task(void *arg)
+{
+    (void)arg;
+    ble_control_rx_frame_t item;
+    for (;;) {
+        if (xQueueReceive(s_ble_control_rx_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (item.connection_generation != s_ble_connection_generation) {
+            continue;
+        }
+        if (item.channel == BLE_CONTROL_CHANNEL_FORWARD &&
+            !halow_sync_bridge_forwarding_enabled()) {
+            ESP_LOGW(TAG, "BLE forward RX ignored after forwarding was disabled");
+            continue;
+        }
+        halow_sync_bridge_note_active_interface(HALOW_SYNC_ACTIVE_INTERFACE_BLE);
+        edgez_frame_protocol_handle_frame(item.frame,
+                                         item.frame_len,
+                                         ble_only_send_frame,
+                                         NULL,
+                                         item.channel == BLE_CONTROL_CHANNEL_FORWARD);
+    }
+}
+
+static esp_err_t ble_control_start_rx_worker(void)
+{
+    if (s_ble_control_rx_task) {
+        return ESP_OK;
+    }
+    if (!s_ble_control_rx_queue) {
+        s_ble_control_rx_queue = xQueueCreate(BLE_CONTROL_RX_QUEUE_DEPTH,
+                                              sizeof(ble_control_rx_frame_t));
+        if (!s_ble_control_rx_queue) {
+            ESP_LOGE(TAG, "Unable to allocate BLE control RX queue");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (xTaskCreate(ble_control_rx_task,
+                    "ble_control_rx",
+                    BLE_CONTROL_RX_TASK_STACK_SIZE,
+                    NULL,
+                    BLE_CONTROL_RX_TASK_PRIORITY,
+                    &s_ble_control_rx_task) != pdPASS) {
+        ESP_LOGE(TAG, "Unable to start BLE control RX worker");
+        vQueueDelete(s_ble_control_rx_queue);
+        s_ble_control_rx_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void ble_control_security_task(void *arg)
+{
+    const uint16_t conn_handle = (uint16_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(BLE_SECURITY_RESTORE_GRACE_MS));
+
+    if (conn_handle == s_ble_conn_handle && !s_ble_secured) {
+        int rc = ble_gap_security_initiate(conn_handle);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "BLE security initiate failed: %d", rc);
+            (void)ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        } else {
+            ESP_LOGI(TAG, "BLE security initiated after bond restore grace period");
+        }
+    } else if (conn_handle == s_ble_conn_handle) {
+        ESP_LOGI(TAG, "BLE bonded encryption restored; skipping repeat pairing");
     }
 
+    s_ble_security_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool ble_control_schedule_security(uint16_t conn_handle)
+{
+    if (s_ble_security_task) {
+        vTaskDelete(s_ble_security_task);
+        s_ble_security_task = NULL;
+    }
+    if (xTaskCreate(ble_control_security_task,
+                    "ble_security",
+                    BLE_SECURITY_TASK_STACK_SIZE,
+                    (void *)(uintptr_t)conn_handle,
+                    BLE_SECURITY_TASK_PRIORITY,
+                    &s_ble_security_task) != pdPASS) {
+        ESP_LOGE(TAG, "Unable to start BLE security task");
+        return false;
+    }
+    return true;
+}
+
+static void ble_control_cancel_security(void)
+{
+    if (s_ble_security_task) {
+        vTaskDelete(s_ble_security_task);
+        s_ble_security_task = NULL;
+    }
 }
 
 static void ble_control_request_data_length(uint16_t conn_handle)
@@ -208,11 +321,11 @@ static void ble_control_request_data_length(uint16_t conn_handle)
         MESH_DEBUG_LOGI("BLE 251-byte data length requested");
     }
     if (rc == BLE_HS_EALREADY) {
-        ble_control_request_2m_phy(conn_handle);
+        ble_control_leave_phy_to_central(conn_handle);
     }
 }
 
-static void ble_control_request_2m_phy(uint16_t conn_handle)
+static void ble_control_leave_phy_to_central(uint16_t conn_handle)
 {
     if (s_ble_phy_requested) {
         return;
@@ -222,12 +335,12 @@ static void ble_control_request_2m_phy(uint16_t conn_handle)
      * The handle captured by CONNECT remains the source of truth while the
      * secured link is active. */
     if (s_ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_ble_secured) {
-        ESP_LOGW(TAG, "BLE 2M PHY request deferred; no secured connection");
+        ESP_LOGW(TAG, "BLE PHY policy deferred; no secured connection");
         return;
     }
     if (conn_handle != s_ble_conn_handle) {
         ESP_LOGW(TAG,
-                 "BLE 2M PHY event handle=%u differs from active handle=%u; using active handle",
+                 "BLE PHY policy event handle=%u differs from active handle=%u; using active handle",
                  conn_handle,
                  s_ble_conn_handle);
         conn_handle = s_ble_conn_handle;
@@ -237,23 +350,19 @@ static void ble_control_request_2m_phy(uint16_t conn_handle)
     int rc = ble_gap_conn_find(conn_handle, &desc);
     if (rc != 0) {
         ESP_LOGW(TAG,
-                 "BLE 2M PHY request deferred; active connection handle=%u unavailable: %d",
+                 "BLE PHY policy deferred; active connection handle=%u unavailable: %d",
                  conn_handle,
                  rc);
         return;
     }
 
-    rc = ble_gap_set_prefered_le_phy(conn_handle,
-                                     BLE_GAP_LE_PHY_2M_MASK,
-                                     BLE_GAP_LE_PHY_2M_MASK,
-                                     0);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
-        /* Keep retries enabled when the host rejects a transient request. */
-        ESP_LOGW(TAG, "BLE 2M PHY request failed handle=%u: %d", conn_handle, rc);
-    } else {
-        s_ble_phy_requested = true;
-        ESP_LOGI(TAG, "BLE 2M PHY requested handle=%u", conn_handle);
-    }
+    /* Do not force a peripheral-initiated 2M transition. Windows adapters in
+     * the field accept the HCI update and then stop acknowledging connection
+     * events until the supervision timeout. Android already calls
+     * setPreferredPhy(2M), so capable mobile centrals retain 2M throughput;
+     * Windows and conservative centrals remain on the stable negotiated PHY. */
+    s_ble_phy_requested = true;
+    ESP_LOGI(TAG, "BLE PHY left under central control handle=%u", conn_handle);
 }
 
 static const struct ble_gatt_svc_def s_ble_gatt_svcs[] = {
@@ -273,9 +382,11 @@ static const struct ble_gatt_svc_def s_ble_gatt_svcs[] = {
                 .access_cb = ble_control_gatt_access,
                 .arg = (void *)(uintptr_t)BLE_CONTROL_CHANNEL_CONTROL,
                 .val_handle = &s_ble_control_tx_val_handle,
-                /* ESP-IDF NimBLE has no per-notify security declaration flags.
-                 * All notification sends are gated on s_ble_secured. */
-                .flags = BLE_GATT_CHR_F_NOTIFY,
+                /* The authenticated read is a side-effect-free link heartbeat
+                 * for centrals which do not honor GattSession.MaintainConnection.
+                 * Notifications remain gated on s_ble_secured as before. */
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC |
+                         BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_NOTIFY,
             },
             {
                 .uuid = BLE_UUID16_DECLARE(0xfff5),
@@ -685,12 +796,19 @@ static void ble_control_process_rx(ble_control_channel_t channel)
         log_hex_limited("BLE RX payload",
                         &endpoint->rx_buf[EDGEZ_FRAME_HEADER_LEN],
                         payload_len);
-        halow_sync_bridge_note_active_interface(HALOW_SYNC_ACTIVE_INTERFACE_BLE);
-        edgez_frame_protocol_handle_frame(endpoint->rx_buf,
-                                         frame_len,
-                                         ble_only_send_frame,
-                                         NULL,
-                                         channel == BLE_CONTROL_CHANNEL_FORWARD);
+        ble_control_rx_frame_t item = {
+            .channel = channel,
+            .frame_len = frame_len,
+            .connection_generation = s_ble_connection_generation,
+        };
+        memcpy(item.frame, endpoint->rx_buf, frame_len);
+        if (!s_ble_control_rx_queue ||
+            xQueueSend(s_ble_control_rx_queue, &item, 0) != pdTRUE) {
+            ESP_LOGW(TAG,
+                     "%s RX worker queue full; dropping protobuf len=%u",
+                     endpoint->name ? endpoint->name : "BLE",
+                     payload_len);
+        }
 
         *endpoint->rx_len -= frame_len;
         if (*endpoint->rx_len > 0) {
@@ -704,10 +822,16 @@ static int ble_control_gatt_access(uint16_t conn_handle,
                                    struct ble_gatt_access_ctxt *ctxt,
                                    void *arg)
 {
-    (void)attr_handle;
     if (!s_ble_secured || conn_handle != s_ble_conn_handle) {
-        ESP_LOGW(TAG, "BLE write rejected before pairing completes");
+        ESP_LOGW(TAG, "BLE GATT access rejected before pairing completes");
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR &&
+        attr_handle == s_ble_control_tx_val_handle) {
+        uint32_t counter = ++s_ble_control_keepalive_counter;
+        return os_mbuf_append(ctxt->om, &counter, sizeof(counter)) == 0
+            ? 0
+            : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
@@ -736,9 +860,7 @@ static int ble_control_gatt_access(uint16_t conn_handle,
             const uint8_t *realtime = &packet[BLE_VOICE_PROTOCOL_HEADER_LEN];
             size_t realtime_len = copied - BLE_VOICE_PROTOCOL_HEADER_LEN;
             err = realtime_len > OPENMANET_COMMS_MAGIC_LEN &&
-                  memcmp(realtime, "OMC", OPENMANET_COMMS_MAGIC_LEN - 1U) == 0 &&
-                  (realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 1U ||
-                   realtime[OPENMANET_COMMS_MAGIC_LEN - 1U] == 2U)
+                  memcmp(realtime, "OMC\1", OPENMANET_COMMS_MAGIC_LEN) == 0
                 ? openmanet_comms_send_phone_frame(realtime, realtime_len)
                 : halow_sync_bridge_handle_voice_to_radio(realtime, realtime_len);
         } else if (memcmp(packet, s_ble_speed_protocol_magic, BLE_VOICE_PROTOCOL_HEADER_LEN) == 0) {
@@ -799,6 +921,7 @@ static void ble_control_host_task(void *param)
 {
     (void)param;
 
+    ESP_LOGI(TAG, "NimBLE host running on core %d", xPortGetCoreID());
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
@@ -814,15 +937,21 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
                  event->connect.status == 0 ? "established" : "failed",
                  event->connect.status);
         if (event->connect.status == 0) {
+            ble_control_reset_rx_work();
             s_ble_conn_handle = event->connect.conn_handle;
-            s_ble_secured = false;
+            /* On a bonded macOS reconnect NimBLE can report ENC_CHANGE before
+             * CONNECT. Preserve that restored security state; DISCONNECT has
+             * already cleared it for every genuinely new connection. */
             s_ble_data_len_requested = false;
             s_ble_phy_requested = false;
             s_ble_control_rx_len = 0;
             s_ble_forward_rx_len = 0;
-            int rc = ble_gap_security_initiate(event->connect.conn_handle);
-            if (rc != 0 && rc != BLE_HS_EALREADY) {
-                ESP_LOGW(TAG, "BLE security initiate failed: %d", rc);
+            /* A bonded central restores encryption immediately after the link
+             * comes up. Starting peripheral security at the same time makes
+             * macOS treat the request as a second pairing and reject it. Give
+             * bond restoration a brief head start, while retaining the same
+             * passkey flow for a new Android, iOS, or macOS central. */
+            if (!ble_control_schedule_security(event->connect.conn_handle)) {
                 (void)ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
         } else if (s_ble_enabled && s_ble_pairing_enabled) {
@@ -832,6 +961,7 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+        ble_control_cancel_security();
         factory_data_sdk_release_reset();
         s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_ble_secured = false;
@@ -839,6 +969,7 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
         s_ble_phy_requested = false;
         s_ble_control_rx_len = 0;
         s_ble_forward_rx_len = 0;
+        ble_control_reset_rx_work();
         halow_sync_bridge_note_ble_connected(false);
         if (s_ble_enabled && s_ble_pairing_enabled) {
             (void)ble_control_start_advertising();
@@ -908,7 +1039,11 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
                 ble_control_cap_log_level_for_ble();
             }
             halow_sync_bridge_note_ble_connected(true);
-            ble_control_request_fast_connection(event->enc_change.conn_handle);
+            /* Connection timing is owned by the central. Android requests
+             * CONNECTION_PRIORITY_HIGH and Windows retains its accepted
+             * ThroughputOptimized request. A peripheral LL update is rejected
+             * by Windows and adds an unnecessary control-procedure collision. */
+            ESP_LOGI(TAG, "BLE connection parameters left under central control");
             return 0;
         }
         ESP_LOGW(TAG,
@@ -953,7 +1088,7 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
                         event->data_len_chg.max_rx_octets,
                         event->data_len_chg.max_rx_time);
         if (s_ble_secured) {
-            ble_control_request_2m_phy(s_ble_conn_handle);
+            ble_control_leave_phy_to_central(s_ble_conn_handle);
         }
         return 0;
 
@@ -1100,6 +1235,7 @@ esp_err_t ble_control_set_enabled(bool enabled)
         s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_ble_control_rx_len = 0;
         s_ble_forward_rx_len = 0;
+        ble_control_reset_rx_work();
         s_ble_host_synced = false;
         s_ble_enabled = false;
         ESP_LOGI(TAG, "BLE disabled");
@@ -1115,7 +1251,12 @@ esp_err_t ble_control_set_enabled(bool enabled)
         s_bt_classic_mem_released = true;
     }
 
-    esp_err_t err = nimble_port_init();
+    esp_err_t err = ble_control_start_rx_worker();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(err));
         return err;

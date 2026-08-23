@@ -226,6 +226,8 @@ static const char *DEVICE_SETTINGS_NVS_UPSTREAM_WIFI_PASSPHRASE = "up_pass";
 static const char *DEVICE_SETTINGS_NVS_BEACON_UNICAST = "bcn_to";
 static const char *DEVICE_SETTINGS_NVS_SLEEP_ENABLED = "sleep_en";
 static const char *DEVICE_SETTINGS_NVS_DEVICE_GPS = "gps_en";
+static const char *DEVICE_SETTINGS_NVS_MESH_FREQUENCY = "mesh_freq";
+static const char *DEVICE_SETTINGS_NVS_MESH_BANDWIDTH = "mesh_bw";
 
 static void device_settings_get_snapshot(ai_edgez_halow_DeviceSettings *out);
 static void device_settings_apply_snapshot(const ai_edgez_halow_DeviceSettings *settings);
@@ -3571,6 +3573,20 @@ static void device_mode_start_halow_from_settings(void)
         return;
     }
 
+    if (settings.mesh_frequency_khz != 0 && settings.mesh_bandwidth_mhz != 0) {
+        esp_err_t radio_err = edgez_platform_get()->network_set_halow_mesh_radio(
+            settings.mesh_frequency_khz,
+            settings.mesh_bandwidth_mhz);
+        if (radio_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Device mode HaLow radio restore failed freq=%lu kHz bw=%luMHz: %s",
+                     (unsigned long)settings.mesh_frequency_khz,
+                     (unsigned long)settings.mesh_bandwidth_mhz,
+                     esp_err_to_name(radio_err));
+            return;
+        }
+    }
+
     device_settings_apply_identity(&settings);
     (void)edgez_platform_get()->network_set_halow_max_hop(settings.max_hop);
     if (settings.device_type != ai_edgez_halow_DeviceType_DEVICE_TYPE_BEACON &&
@@ -3640,6 +3656,8 @@ static esp_err_t device_settings_load_from_nvs(void)
     (void)nvs_get_u32(nvs, DEVICE_SETTINGS_NVS_INTERVAL, &loaded.beacon_interval_seconds);
     (void)nvs_get_u32(nvs, DEVICE_SETTINGS_NVS_MAX_HOP, &loaded.max_hop);
     (void)nvs_get_u32(nvs, DEVICE_SETTINGS_NVS_GEO_INDEX, &loaded.geo_index);
+    (void)nvs_get_u32(nvs, DEVICE_SETTINGS_NVS_MESH_FREQUENCY, &loaded.mesh_frequency_khz);
+    (void)nvs_get_u32(nvs, DEVICE_SETTINGS_NVS_MESH_BANDWIDTH, &loaded.mesh_bandwidth_mhz);
     (void)nvs_get_u64(nvs, DEVICE_SETTINGS_NVS_USER_HIGH, &loaded.user_id_high);
     (void)nvs_get_u64(nvs, DEVICE_SETTINGS_NVS_USER_LOW, &loaded.user_id_low);
     size_t len = sizeof(loaded.mesh_id);
@@ -3692,7 +3710,7 @@ static esp_err_t device_settings_load_from_nvs(void)
     (void)edgez_platform_get()->network_set_halow_beacon_device_type((uint32_t)loaded.device_type);
     device_settings_apply_sensor_config(&loaded);
     ESP_LOGI(TAG,
-             "Device settings loaded type=%u sleep_enabled=%u device_gps=%u mesh_id=%s passphrase=%s upstream_wifi=%s upstream_passphrase=%s beacon_unicast=0x%012llx user=%s marker=%u interval=%lu max_hop=%lu share_location=%u lat=%f lon=%f geo=%u geo_index=%lu uart_i2c_sensor=%s rs485_sensor=%s pub=%u priv=%u",
+             "Device settings loaded type=%u sleep_enabled=%u device_gps=%u mesh_id=%s passphrase=%s upstream_wifi=%s upstream_passphrase=%s beacon_unicast=0x%012llx user=%s marker=%u interval=%lu max_hop=%lu radio=%lu kHz/%luMHz share_location=%u lat=%f lon=%f geo=%u geo_index=%lu uart_i2c_sensor=%s rs485_sensor=%s pub=%u priv=%u",
              (unsigned)loaded.device_type,
              loaded.sleep_mode_enabled ? 1U : 0U,
              loaded.device_gps_enabled ? 1U : 0U,
@@ -3705,6 +3723,8 @@ static esp_err_t device_settings_load_from_nvs(void)
              (unsigned)loaded.marker,
              (unsigned long)loaded.beacon_interval_seconds,
              (unsigned long)loaded.max_hop,
+             (unsigned long)loaded.mesh_frequency_khz,
+             (unsigned long)loaded.mesh_bandwidth_mhz,
              loaded.share_location ? 1 : 0,
              (double)loaded.latitude,
              (double)loaded.longitude,
@@ -3743,6 +3763,8 @@ static esp_err_t device_settings_save_to_nvs(const ai_edgez_halow_DeviceSettings
     if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_MARKER, (uint32_t)settings->marker);
     if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_INTERVAL, normalize_device_beacon_interval(settings->beacon_interval_seconds));
     if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_MAX_HOP, normalize_device_max_hop(settings->max_hop));
+    if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_MESH_FREQUENCY, settings->mesh_frequency_khz);
+    if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_MESH_BANDWIDTH, settings->mesh_bandwidth_mhz);
     if (err == ESP_OK) err = nvs_set_u32(nvs, DEVICE_SETTINGS_NVS_GEO_INDEX, settings->geo_index);
     if (err == ESP_OK) err = nvs_set_str(nvs, DEVICE_SETTINGS_NVS_UART_I2C_SENSOR_TYPE, settings->uart_i2c_sensor_type);
     if (err == ESP_OK) err = nvs_set_str(nvs, DEVICE_SETTINGS_NVS_RS485_SENSOR_TYPE, settings->rs485_sensor_type);
@@ -4297,7 +4319,15 @@ static esp_err_t handle_device_settings(const ai_edgez_halow_NetworkPacket *msg,
     const ai_edgez_halow_DeviceSettings *settings = &msg->body.device_settings;
     esp_err_t err = ESP_OK;
     if (settings->action == ai_edgez_halow_DeviceSettingsAction_DEVICE_SETTINGS_SET) {
+        ai_edgez_halow_DeviceSettings previous = ai_edgez_halow_DeviceSettings_init_zero;
         ai_edgez_halow_DeviceSettings updated = *settings;
+        device_settings_get_snapshot(&previous);
+        if (updated.mesh_frequency_khz == 0) {
+            updated.mesh_frequency_khz = previous.mesh_frequency_khz;
+        }
+        if (updated.mesh_bandwidth_mhz == 0) {
+            updated.mesh_bandwidth_mhz = previous.mesh_bandwidth_mhz;
+        }
         if (updated.device_gps_enabled &&
             !edgez_platform_get()->gps_supported()) {
             ESP_LOGW(TAG, "Device GPS enable ignored: L76K support is unavailable");
@@ -4305,13 +4335,38 @@ static esp_err_t handle_device_settings(const ai_edgez_halow_NetworkPacket *msg,
         }
         updated.action = ai_edgez_halow_DeviceSettingsAction_DEVICE_SETTINGS_REPORT;
         device_settings_apply_defaults(&updated);
+        bool radio_changed = updated.mesh_frequency_khz != 0 &&
+                             updated.mesh_bandwidth_mhz != 0 &&
+                             (updated.mesh_frequency_khz != previous.mesh_frequency_khz ||
+                              updated.mesh_bandwidth_mhz != previous.mesh_bandwidth_mhz);
+        if (radio_changed) {
+            err = edgez_platform_get()->network_set_halow_mesh_radio(
+                updated.mesh_frequency_khz,
+                updated.mesh_bandwidth_mhz);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "Device settings mesh radio rejected freq=%lu kHz bw=%luMHz: %s",
+                         (unsigned long)updated.mesh_frequency_khz,
+                         (unsigned long)updated.mesh_bandwidth_mhz,
+                         esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG,
+                         "Device settings mesh radio changed %lu kHz/%luMHz -> %lu kHz/%luMHz; firmware peer/key teardown requested",
+                         (unsigned long)previous.mesh_frequency_khz,
+                         (unsigned long)previous.mesh_bandwidth_mhz,
+                         (unsigned long)updated.mesh_frequency_khz,
+                         (unsigned long)updated.mesh_bandwidth_mhz);
+            }
+        }
         if (updated.has_geo_fence) {
             updated.geo_fence.geo_index = updated.geo_index;
         }
-        device_settings_apply_snapshot(&updated);
-        err = device_settings_save_to_nvs(&updated);
-        device_settings_apply_identity(&updated);
-        (void)edgez_platform_get()->network_set_halow_max_hop(updated.max_hop);
+        if (err == ESP_OK) {
+            device_settings_apply_snapshot(&updated);
+            err = device_settings_save_to_nvs(&updated);
+            device_settings_apply_identity(&updated);
+            (void)edgez_platform_get()->network_set_halow_max_hop(updated.max_hop);
+        }
         if (err == ESP_OK) {
             device_settings_apply_sensor_config(&updated);
             device_gps_apply_if_halow_ready(&updated);
@@ -4353,7 +4408,7 @@ static esp_err_t handle_device_settings(const ai_edgez_halow_NetworkPacket *msg,
         } else {
             disconnected_power_policy_schedule("device_type");
         }
-        if (device_type_is_autonomous(updated.device_type)) {
+        if (err == ESP_OK && device_type_is_autonomous(updated.device_type)) {
             device_mode_start_halow_from_settings();
         }
     } else {
@@ -4514,6 +4569,7 @@ void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
     static uint8_t last_peer_mac[6];
     static uint64_t last_user_id_high;
     static uint64_t last_user_id_low;
+    static uint32_t last_channel_number;
     static uint32_t last_notify_ms;
 
     if (!beacon_identity_is_complete(beacon)) {
@@ -4534,14 +4590,20 @@ void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
     bool duplicate = false;
     if (peer_mac != NULL && !mac_is_zero_bytes(peer_mac)) {
         portENTER_CRITICAL(&notify_dedupe_lock);
-        duplicate = memcmp(last_peer_mac, peer_mac, sizeof(last_peer_mac)) == 0 &&
-                    last_user_id_high == beacon->user_id_high &&
-                    last_user_id_low == beacon->user_id_low &&
+        const bool same_identity =
+            memcmp(last_peer_mac, peer_mac, sizeof(last_peer_mac)) == 0 &&
+            last_user_id_high == beacon->user_id_high &&
+            last_user_id_low == beacon->user_id_low;
+        const bool channel_is_duplicate =
+            beacon->channel_number == 0U ||
+            beacon->channel_number == last_channel_number;
+        duplicate = same_identity && channel_is_duplicate &&
                     (uint32_t)(now - last_notify_ms) < 500U;
         if (!duplicate) {
             memcpy(last_peer_mac, peer_mac, sizeof(last_peer_mac));
             last_user_id_high = beacon->user_id_high;
             last_user_id_low = beacon->user_id_low;
+            last_channel_number = beacon->channel_number;
             last_notify_ms = now;
         }
         portEXIT_CRITICAL(&notify_dedupe_lock);
