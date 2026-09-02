@@ -4175,19 +4175,6 @@ static void device_beacon_task(void *arg)
                     edgez_platform_get()->led_flash_beacon();
                 }
                 send_local_beacon_to_mobile(&beacon);
-                ESP_LOGI(TAG,
-                         "Periodic management beacon refresh interval=%lu peer_independent=1 user=%016llx-%016llx marker=%u type=%u loc=%u geo=%u geo_index=%lu peers=%u sensor_data=%u err=%s",
-                         (unsigned long)interval_seconds,
-                         (unsigned long long)beacon.user_id_high,
-                         (unsigned long long)beacon.user_id_low,
-                         (unsigned)beacon.marker,
-                         (unsigned)beacon.device_type,
-                         beacon_has_location ? 1U : 0U,
-                         beacon.has_geo_fence ? 1 : 0,
-                         beacon.has_geo_fence ? (unsigned long)beacon.geo_fence.geo_index : 0UL,
-                         (unsigned)report.peers_count,
-                         (unsigned)beacon.sensor_data_count,
-                         esp_err_to_name(err));
             }
         }
         /* Preserve the periodic interval, but allow an accepted mobile
@@ -4377,30 +4364,6 @@ static esp_err_t handle_device_settings(const ai_edgez_halow_NetworkPacket *msg,
                          "BLE NetworkPacket.device_settings accepted; immediate beacon triggered");
             }
         }
-        ESP_LOGI(TAG,
-                 "Device settings SET type=%u sleep_enabled=%u device_gps=%u mesh_id=%s passphrase=%s upstream_wifi=%s upstream_passphrase=%s beacon_unicast=0x%012llx user=%s marker=%u interval=%lu max_hop=%lu share_location=%u lat=%f lon=%f geo=%u geo_index=%lu uart_i2c_sensor=%s rs485_sensor=%s pub=%u priv=%u err=%s",
-                 (unsigned)updated.device_type,
-                 updated.sleep_mode_enabled ? 1U : 0U,
-                 updated.device_gps_enabled ? 1U : 0U,
-                 updated.mesh_id,
-                 updated.passphrase[0] ? "set" : "open",
-                 updated.upstream_wifi_ssid[0] ? updated.upstream_wifi_ssid : "none",
-                 updated.upstream_wifi_passphrase[0] ? "set" : "open",
-                 (unsigned long long)(updated.beacon_unicast & 0xffffffffffffULL),
-                 updated.user_name,
-                 (unsigned)updated.marker,
-                 (unsigned long)updated.beacon_interval_seconds,
-                 (unsigned long)updated.max_hop,
-                 updated.share_location ? 1 : 0,
-                 (double)updated.latitude,
-                 (double)updated.longitude,
-                 updated.has_geo_fence ? 1 : 0,
-                 (unsigned long)updated.geo_index,
-                 updated.uart_i2c_sensor_type,
-                 updated.rs485_sensor_type,
-                 (unsigned)updated.user_public_key.size,
-                 (unsigned)updated.user_private_key.size,
-                 esp_err_to_name(err));
         device_type_apply_status_led(updated.device_type);
         if (bridge_has_connected_interface()) {
             device_mode_ble_shutdown_cancel();
@@ -4552,7 +4515,7 @@ static void notify_topology_report(const uint8_t peer_mac[6], uint16_t seq)
                  (unsigned long long)(peer_mac != NULL ? mac_to_u64(peer_mac) : 0),
                  (unsigned)msg.body.report.peers_count,
                  (unsigned)stream.bytes_written);
-    } else {
+    } else if (report_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG,
                  "NetworkPacket report broadcast failed observer=0x%012llx peers=%u err=%s",
                  (unsigned long long)(msg.from & 0xffffffffffffULL),

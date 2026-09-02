@@ -982,9 +982,10 @@ static int ble_control_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.attr_handle,
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
-        if (s_ble_secured && event->subscribe.cur_indicate) {
+        if (s_ble_secured && event->subscribe.cur_notify &&
+            event->subscribe.attr_handle == s_ble_control_tx_val_handle) {
             /* Pairing completes before Android enables the control CCC. Wake
-             * the bridge only after indications are writable so the initial
+             * the bridge only after notifications are writable so the initial
              * device-settings/status pair cannot be lost in that race. */
             halow_sync_bridge_request_status_report();
         }

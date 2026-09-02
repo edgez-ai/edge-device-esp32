@@ -26,7 +26,6 @@
 #include <driver/uart.h>
 #include <sdkconfig.h>
 #include <mbedtls/aes.h>
-#include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/version.h>
 
@@ -1307,33 +1306,6 @@ static esp_err_t halow_edgez_encode_assoc_metadata(uint8_t *out,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG,
-             "EdgeZ beacon metadata encoded sensor_data=%u len=%u",
-             (unsigned)metadata.sensor_data_count,
-             (unsigned)stream.bytes_written);
-    for (pb_size_t i = 0; i < metadata.sensor_data_count; ++i) {
-        const ai_edgez_halow_SensorData *entry = &metadata.sensor_data[i];
-        if (entry->which_value == ai_edgez_halow_SensorData_float_value_tag) {
-            ESP_LOGI(TAG,
-                     "EdgeZ beacon SensorData[%u] type=%u float_value=%.3f",
-                     (unsigned)i,
-                     (unsigned)entry->type,
-                     (double)entry->value.float_value);
-        } else if (entry->which_value == ai_edgez_halow_SensorData_int_value_tag) {
-            ESP_LOGI(TAG,
-                     "EdgeZ beacon SensorData[%u] type=%u int_value=%ld",
-                     (unsigned)i,
-                     (unsigned)entry->type,
-                     (long)entry->value.int_value);
-        } else if (entry->which_value == ai_edgez_halow_SensorData_bool_value_tag) {
-            ESP_LOGI(TAG,
-                     "EdgeZ beacon SensorData[%u] type=%u bool_value=%u",
-                     (unsigned)i,
-                     (unsigned)entry->type,
-                     entry->value.bool_value ? 1U : 0U);
-        }
-    }
-
     *out_len = stream.bytes_written;
     return ESP_OK;
 }
@@ -1354,33 +1326,6 @@ static bool halow_edgez_decode_assoc_metadata(const uint8_t *payload,
     }
 
     return true;
-}
-
-static void halow_edgez_log_beacon_base64(const char *prefix,
-                                          const uint8_t *payload,
-                                          size_t payload_len)
-{
-    if (!prefix || !payload || payload_len == 0) {
-        return;
-    }
-
-    char beacon_b64[((ai_edgez_halow_Beacon_size + 2U) / 3U * 4U) + 1U] = {0};
-    size_t beacon_b64_len = 0;
-    if (mbedtls_base64_encode((uint8_t *)beacon_b64,
-                              sizeof(beacon_b64),
-                              &beacon_b64_len,
-                              payload,
-                              payload_len) != 0 ||
-        beacon_b64_len >= sizeof(beacon_b64)) {
-        ESP_LOGW(TAG, "%s beacon_base64 encode failed len=%u", prefix, (unsigned)payload_len);
-        return;
-    }
-
-    beacon_b64[beacon_b64_len] = '\0';
-    ESP_LOGI(TAG, "%s beacon_base64 len=%u text=%s",
-             prefix,
-             (unsigned)beacon_b64_len,
-             beacon_b64);
 }
 
 static esp_err_t halow_build_edgez_assoc_ie(const char *mesh_id,
@@ -1418,11 +1363,6 @@ static esp_err_t halow_build_edgez_assoc_ie(const char *mesh_id,
     out[1] = (uint8_t)(EDGEZ_ASSOC_IE_VENDOR_LEN + beacon_len);
     memcpy(&out[2], EDGEZ_ASSOC_IE_VENDOR, EDGEZ_ASSOC_IE_VENDOR_LEN);
     *out_len = payload_off + beacon_len;
-    ESP_LOGI(TAG,
-             "EdgeZ compact beacon IE prepared: vendor=%s beacon_len=%u ie_len=%u",
-             EDGEZ_ASSOC_IE_VENDOR,
-             (unsigned)beacon_len,
-             (unsigned)*out_len);
     return ESP_OK;
 }
 
@@ -1580,9 +1520,6 @@ static bool halow_parse_edgez_discovery_ie(const uint8_t *ies,
             continue;
         }
 
-        ESP_LOGI(TAG, "EdgeZ compact beacon IE accepted: vendor=%s beacon_len=%u",
-                 EDGEZ_ASSOC_IE_VENDOR, (unsigned)beacon_len);
-        halow_edgez_log_beacon_base64("EdgeZ beacon IE", metadata_out, beacon_len);
         *metadata_out_len = beacon_len;
         return true;
     }
