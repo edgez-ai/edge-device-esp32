@@ -4524,6 +4524,64 @@ static void notify_topology_report(const uint8_t peer_mac[6], uint16_t seq)
     }
 }
 
+static void broadcast_beacon(const ai_edgez_halow_Beacon *beacon,
+                             const uint8_t peer_mac[6],
+                             uint16_t seq)
+{
+    ai_edgez_halow_NetworkPacket msg = ai_edgez_halow_NetworkPacket_init_zero;
+    fill_response_base(&msg, NULL);
+    if (!beacon || !peer_mac || mac_is_zero_bytes(peer_mac)) {
+        ESP_LOGW(TAG, "NetworkPacket beacon broadcast skipped; peer MAC unavailable");
+        return;
+    }
+    msg.from = mac_to_u64(peer_mac);
+    msg.to = 0;
+    msg.operation = ai_edgez_halow_Operation_BROADCAST;
+    msg.which_body = ai_edgez_halow_NetworkPacket_beacon_tag;
+    msg.body.beacon = *beacon;
+
+    uint8_t encoded[ai_edgez_halow_NetworkPacket_size] = {0};
+    pb_ostream_t stream = pb_ostream_from_buffer(encoded, sizeof(encoded));
+    if (!pb_encode(&stream, ai_edgez_halow_NetworkPacket_fields, &msg)) {
+        ESP_LOGW(TAG,
+                 "NetworkPacket beacon broadcast encode failed: %s",
+                 PB_GET_ERROR(&stream));
+        return;
+    }
+
+    /* Seed app-delivery dedupe with the locally emitted packet. If another
+     * observer rebroadcasts the same beacon back to this node, the app still
+     * sees a single discovery event. */
+    uint64_t checksum = 0;
+    (void)delivery_dedupe_check_and_add(msg.from,
+                                        encoded,
+                                        stream.bytes_written,
+                                        &checksum);
+
+    esp_err_t beacon_err = edgez_platform_get()->halow_send_peer_independent_beacon(
+        encoded,
+        stream.bytes_written,
+        msg.from,
+        0,
+        0,
+        0,
+        default_network_packet_max_hop(),
+        seq);
+    if (beacon_err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "NetworkPacket beacon BATMAN broadcast seq=%u from=0x%012llx len=%u checksum=%016llx",
+                 (unsigned)seq,
+                 (unsigned long long)(msg.from & 0xffffffffffffULL),
+                 (unsigned)stream.bytes_written,
+                 (unsigned long long)checksum);
+    } else if (beacon_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG,
+                 "NetworkPacket beacon BATMAN broadcast failed from=0x%012llx err=%s",
+                 (unsigned long long)(msg.from & 0xffffffffffffULL),
+                 esp_err_to_name(beacon_err));
+    }
+}
+
 void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
                                      const uint8_t peer_mac[6],
                                      int32_t rssi_dbm)
@@ -4584,6 +4642,9 @@ void halow_sync_bridge_notify_beacon(const ai_edgez_halow_Beacon *beacon,
 
     uint16_t seq = ++s_from_radio_seq;
     notify_beacon_to_mobile(beacon, peer_mac);
+    if (beacon->device_type == ai_edgez_halow_DeviceType_DEVICE_TYPE_BEACON) {
+        broadcast_beacon(beacon, peer_mac, seq);
+    }
     notify_topology_report(peer_mac, seq);
 }
 
@@ -4881,9 +4942,9 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
     }
 
     uint16_t ethertype = ((uint16_t)header[12] << 8) | header[13];
-    bool is_peer_independent_report = ethertype == HALOW_SYNC_REPORT_ETHERTYPE;
+    bool is_peer_independent = ethertype == HALOW_SYNC_REPORT_ETHERTYPE;
     if ((ethertype != HALOW_SYNC_ETHERTYPE &&
-         !is_peer_independent_report) ||
+         !is_peer_independent) ||
         payload_len > (EDGEZ_ROUTE_PREFIX_LEN + ai_edgez_halow_NetworkPacket_size)) {
         return false;
     }
@@ -5153,11 +5214,16 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
                                         ai_edgez_halow_NetworkPacket_fields,
                                         &msg);
     }
-    if (is_peer_independent_report &&
+    if (is_peer_independent &&
         (!have_network_packet ||
-         msg.which_body != ai_edgez_halow_NetworkPacket_report_tag)) {
+         (msg.which_body != ai_edgez_halow_NetworkPacket_report_tag &&
+          msg.which_body != ai_edgez_halow_NetworkPacket_beacon_tag) ||
+         (msg.which_body == ai_edgez_halow_NetworkPacket_beacon_tag &&
+          (msg.body.beacon.device_type !=
+               ai_edgez_halow_DeviceType_DEVICE_TYPE_BEACON ||
+           !beacon_identity_is_complete(&msg.body.beacon))))) {
         MESH_DEBUG_LOGI(
-            "NetworkPacket RX drop invalid peer-independent report decoded=%u body=%u len=%u",
+            "NetworkPacket RX drop invalid peer-independent packet decoded=%u body=%u len=%u",
             have_network_packet ? 1U : 0U,
             have_network_packet ? (unsigned)msg.which_body : 0U,
             (unsigned)payload_len);
@@ -5169,6 +5235,7 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
         if (!is_ack &&
             msg.which_body != ai_edgez_halow_NetworkPacket_msg_tag &&
             msg.which_body != ai_edgez_halow_NetworkPacket_payload_tag &&
+            msg.which_body != ai_edgez_halow_NetworkPacket_beacon_tag &&
             msg.which_body != ai_edgez_halow_NetworkPacket_report_tag) {
             ESP_LOGW(TAG,
                      "NetworkPacket RX notify skipped; unsupported body=%u mime=%u len=%u",
@@ -5371,16 +5438,22 @@ bool halow_sync_bridge_handle_rx_frame(uint8_t *header,
     bool notify_is_ack = have_network_packet && msg.operation == ai_edgez_halow_Operation_ACKNOWLEDGE;
     bool notify_is_report = have_network_packet &&
                             msg.which_body == ai_edgez_halow_NetworkPacket_report_tag;
+    bool notify_is_beacon = have_network_packet &&
+                            msg.which_body == ai_edgez_halow_NetworkPacket_beacon_tag;
+    /* A BATMAN-delivered beacon is an application discovery announcement,
+     * not evidence of a direct radio link. Do not feed it through
+     * halow_sync_bridge_notify_beacon() or update s_topology_peers here;
+     * topology reports remain the sole authority for physical adjacency. */
     bool notify_is_global_buffer_chunk = have_network_packet &&
                                          global_buffer_packet_is_chunk(&msg);
     const uint8_t *dedupe_message = have_beacon ?
                                     msg.body.payload.bytes :
-                                    ((notify_is_ack || notify_is_report ||
+                                    ((notify_is_ack || notify_is_report || notify_is_beacon ||
                                       notify_is_global_buffer_chunk) ?
                                          network_payload : msg.body.msg.payload.bytes);
     size_t dedupe_message_len = have_beacon ?
                                 msg.body.payload.size :
-                                ((notify_is_ack || notify_is_report ||
+                                ((notify_is_ack || notify_is_report || notify_is_beacon ||
                                   notify_is_global_buffer_chunk) ?
                                      network_payload_len : msg.body.msg.payload.size);
     uint64_t delivery_checksum = 0;

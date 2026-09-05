@@ -1564,9 +1564,7 @@ bool halow_edgez_mesh_peer_admission_allowed(const uint8_t *ies,
                 *device_type = (uint32_t)beacon.device_type;
             }
             return beacon.device_type !=
-                       ai_edgez_halow_DeviceType_DEVICE_TYPE_BEACON &&
-                   beacon.device_type !=
-                       ai_edgez_halow_DeviceType_DEVICE_TYPE_SENSOR;
+                       ai_edgez_halow_DeviceType_DEVICE_TYPE_BEACON;
         }
         ie_off = next;
     }

@@ -697,10 +697,9 @@ static esp_err_t send_mesh_payload_internal(const uint8_t *payload,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Topology reports are already complete NetworkPacket protobuf messages.
-     * Carry them as an Ethernet frame inside BATMAN broadcast so every mesh
-     * originator participates in duplicate suppression and multi-hop fanout.
-     * The management/device beacon remains a separate radio-native path. */
+    /* Topology reports and received device beacons are complete NetworkPacket
+     * protobuf messages. Carry them inside BATMAN broadcast so they reach
+     * every mesh node using the same multi-hop fanout as public channels. */
     if (peer_independent_ethertype == HALOW_SYNC_REPORT_ETHERTYPE) {
         constexpr size_t batmanPayloadCapacity =
             EDGEZ_BATADV_MAX_PACKET_LEN - EDGEZ_BATADV_BCAST_HEADER_LEN;
@@ -716,7 +715,7 @@ static esp_err_t send_mesh_payload_internal(const uint8_t *payload,
         frame[13] = (uint8_t)HALOW_SYNC_REPORT_ETHERTYPE;
         memcpy(frame + 14, payload, payload_len);
         MESH_DEBUG_LOGI(
-            "HaLow topology report send BATMAN broadcast protobuf len=%u",
+            "HaLow peer-independent BATMAN broadcast protobuf len=%u",
             (unsigned)payload_len);
         EdgezRadioError err = s_halow.sendBatmanBroadcastPayload(
             frame, 14 + payload_len);
